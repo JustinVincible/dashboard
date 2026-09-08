@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""jobdash web service.
+
+Serves the dashboard on 127.0.0.1. Every route reads SQLite or the poller's
+in-memory snapshot, so page loads never wait on ssh. `/api/logtail` is the one
+exception, and it is opt-in per click — it runs its ssh on a worker thread with
+the cluster's own timeout, so a slow cluster delays that one request and nothing
+else. Read-only by design — there is no route that can touch a job on the
+cluster.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+import collector
+import queries
+import store
+from poller import Poller
+
+HERE = Path(__file__).parent
+app = FastAPI(title="jobdash")
+poller: Poller | None = None
+
+
+@app.on_event("startup")
+def _startup():
+    global poller
+    poller = Poller()
+    store.backfill_jsonl(poller.conn, Path.home() / ".local/state/jobdash/history.jsonl")
+    store.rollup(poller.conn)
+    store.prune(poller.conn)
+    poller.start()
+
+
+@app.get("/")
+def index():
+    return FileResponse(HERE / "static/index.html")
+
+
+@app.get("/api/live")
+def live():
+    return JSONResponse(poller.latest)
+
+
+@app.get("/api/config")
+def config():
+    st = poller.st
+    return {"interval": st.interval, "stall_minutes": st.stall_minutes,
+            "low_util_pct": st.low_util_pct, "timeleft_warn_min": st.timeleft_warn_min,
+            "clusters": [c.name for c in st.clusters]}
+
+
+@app.get("/api/series/{cluster}/{jid}")
+def series(cluster: str, jid: str, days: float = 7):
+    return queries.job_series(poller.conn, cluster, jid, days)
+
+
+@app.get("/api/logtail/{cluster}/{jid}")
+async def logtail(cluster: str, jid: str, lines: int = 80):
+    """The last N lines of a running job's log, fetched when asked for."""
+    cl = next((c for c in poller.st.clusters if c.name == cluster), None)
+    if cl is None:
+        return JSONResponse({"path": "", "text": f"(unknown cluster {cluster})"})
+    path, text = await asyncio.to_thread(collector.log_tail, cl, jid, lines)
+    return {"path": path, "text": text}
+
+
+@app.get("/api/cluster_util")
+def cluster_util(days: float = 1, bucket: int = 300):
+    return queries.cluster_util(poller.conn, days, bucket)
+
+
+@app.get("/api/gpu_hours")
+def gpu_hours(days: float = 30):
+    return queries.gpu_hours(poller.conn, days)
+
+
+@app.get("/api/queue_waits")
+def queue_waits(days: float = 30):
+    return queries.queue_waits(poller.conn, days)
+
+
+@app.get("/api/failures")
+def failures(days: float = 30):
+    return queries.failures(poller.conn, days)
+
+
+@app.get("/api/finished")
+def finished(days: float = 7):
+    return queries.recent_finished(poller.conn, days)
+
+
+@app.get("/api/timeline")
+def timeline(days: float = 7):
+    return queries.timeline(poller.conn, days)
+
+
+@app.get("/api/compare")
+def compare(job: list[str] = Query(default=[]), days: float = 30):
+    """?job=cluster/jid repeated. Loss curves for a sweep, on one step axis."""
+    pairs = [tuple(j.split("/", 1)) for j in job if "/" in j][:12]
+    return queries.compare_loss(poller.conn, pairs, days)
+
+
+@app.get("/api/alerts")
+def alerts(days: float = 14):
+    return queries.alert_history(poller.conn, days)
+
+
+@app.post("/api/alerts/{key:path}/ack")
+def ack(key: str):
+    store.ack_alert(poller.conn, key)
+    poller.latest["alerts"] = poller.active_alerts()
+    return {"ok": True}
+
+
+@app.post("/api/refresh")
+def refresh():
+    poller.refresh_now()
+    return {"ok": True}
+
+
+@app.get("/events")
+async def events(request: Request):
+    """SSE. One message per poller tick, so the browser mirrors the ssh cadence
+    instead of polling on its own clock."""
+    async def gen():
+        seen = -1
+        while True:
+            if await request.is_disconnected():
+                return
+            gen_id = await asyncio.to_thread(poller.wait_for_change, seen, 25.0)
+            if gen_id > seen:
+                seen = gen_id
+                yield f"data: {json.dumps(poller.latest)}\n\n"
+            else:
+                yield ": keepalive\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+class NoCacheStatic(StaticFiles):
+    """Revalidate every asset. This is a localhost app served off an SSD, so a
+    stale cached app.js after an edit costs far more than the round-trip does.
+    """
+
+    def file_response(self, *a, **kw):
+        r = super().file_response(*a, **kw)
+        r.headers["Cache-Control"] = "no-cache"
+        return r
+
+
+app.mount("/vendor", StaticFiles(directory=HERE / "vendor"), name="vendor")
+app.mount("/static", NoCacheStatic(directory=HERE / "static"), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8787)
+    a = ap.parse_args()
+    uvicorn.run(app, host=a.host, port=a.port, log_level="info")

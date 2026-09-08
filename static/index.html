@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jobdash</title>
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>📊</text></svg>">
+</head>
+<body>
+
+<header>
+  <h1>jobdash</h1>
+  <span id="dot" title="stream status"></span>
+  <span id="clusters"></span>
+  <span class="spacer"></span>
+  <span class="pill" id="updated">—</span>
+  <button id="refresh">refresh now</button>
+</header>
+
+<nav>
+  <button data-tab="overview" class="active">overview</button>
+  <button data-tab="usage">usage</button>
+  <button data-tab="compare">compare</button>
+  <button data-tab="history">history</button>
+  <button data-tab="alerts">alerts</button>
+</nav>
+
+<main>
+
+<section id="tab-overview">
+  <div class="grid">
+    <div class="card wide">
+      <h2>jobs <span class="dim" id="job-count"></span></h2>
+      <div class="toolbar">
+        <input id="filter" type="search" placeholder="filter by name, jobid, partition, node"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <div id="jobtable"></div>
+    </div>
+
+    <div class="card wide" id="detail-card" hidden>
+      <h2 id="detail-title">job</h2>
+      <div class="stats" style="margin-bottom:12px" id="detail-stats"></div>
+      <div class="toolbar">
+        <button id="tail-btn">fetch log tail</button>
+        <span class="dim" id="tail-note"></span>
+      </div>
+      <pre class="log" id="detail-log"></pre>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:12px">
+        <div style="flex:1;min-width:320px"><div class="chart" id="chart-loss"></div></div>
+        <div style="flex:1;min-width:320px"><div class="chart" id="chart-job-gpu"></div></div>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <h2>active alerts</h2>
+      <div id="alerts-live"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-usage" hidden>
+  <div class="grid">
+    <div class="card wide">
+      <h2>gpu utilization <span class="dim" id="util-range-lbl"></span></h2>
+      <div style="margin-bottom:8px" id="util-range"></div>
+      <div class="chart" id="chart-util" style="height:230px"></div>
+    </div>
+    <div class="card wide">
+      <h2>gpu-hours &amp; waste <span class="dim">(last 30d, integrated from samples)</span></h2>
+      <div class="stats" id="waste-stats" style="margin-bottom:12px"></div>
+      <div id="waste-table"></div>
+    </div>
+    <div class="card">
+      <h2>queue wait by partition</h2>
+      <div id="waits"></div>
+    </div>
+    <div class="card">
+      <h2>outcomes (last 30d)</h2>
+      <div id="failures"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-compare" hidden>
+  <div class="grid">
+    <div class="card wide">
+      <h2>compare runs <span class="dim">(loss by step, so runs of different lengths line up)</span></h2>
+      <div class="toolbar">
+        <input id="cmp-filter" type="search" placeholder="filter runs" autocomplete="off">
+        <button id="cmp-clear">clear</button>
+        <span class="dim" id="cmp-note"></span>
+      </div>
+      <div class="picker" id="cmp-picker"></div>
+      <div class="chart" id="chart-compare" style="height:300px;margin-top:12px"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-history" hidden>
+  <div class="grid">
+    <div class="card wide">
+      <h2>timeline <span class="dim">(last 7d — queued vs running)</span></h2>
+      <div class="gantt" id="gantt"></div>
+    </div>
+    <div class="card wide">
+      <h2>finished jobs</h2>
+      <div id="finished"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-alerts" hidden>
+  <div class="grid">
+    <div class="card wide">
+      <h2>alert history <span class="dim">(last 14d)</span></h2>
+      <div id="alerts-all"></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script src="/vendor/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

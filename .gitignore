@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+jobdash.db
+jobdash.db-wal
+jobdash.db-shm

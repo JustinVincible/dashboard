@@ -22,6 +22,7 @@
 <nav>
   <button data-tab="overview" class="active">overview</button>
   <button data-tab="usage">usage</button>
+  <button data-tab="clusters">clusters</button>
   <button data-tab="compare">compare</button>
   <button data-tab="history">history</button>
   <button data-tab="alerts">alerts</button>
@@ -81,7 +82,20 @@
       <h2>outcomes (last 30d)</h2>
       <div id="failures"></div>
     </div>
+    <div class="card wide">
+      <h2>memory efficiency <span class="dim">(finished jobs — asked vs peak used)</span></h2>
+      <div id="memeff"></div>
+    </div>
   </div>
+</section>
+
+<section id="tab-clusters" hidden>
+  <div class="toolbar">
+    <span id="cl-range"></span>
+    <span class="spacer"></span>
+    <span class="dim" id="cl-note"></span>
+  </div>
+  <div class="grid" id="cluster-cards"></div>
 </section>
 
 <section id="tab-compare" hidden>

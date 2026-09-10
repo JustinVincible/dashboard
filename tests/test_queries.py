@@ -200,3 +200,133 @@ def test_rollup_merges_a_second_pass_into_an_existing_hour(conn):
     assert r["n"] == 2
     assert r["util"] == 60.0
     assert conn.execute("SELECT COUNT(*) c FROM samples").fetchone()["c"] == 0
+
+
+# ------------------------------------------------------------------ energy --
+
+def test_energy_integrates_watts_over_time(conn, now):
+    """One hour at a steady 300 W is 0.3 kWh, and costs the rate."""
+    n = 3600 // INTERVAL + 1
+    seed_samples(conn, "gaivi", "e1", now - 3600, n, power_w=300)
+
+    out = queries.energy(conn, days=1, price_per_kwh=0.20)
+    row = next(r for r in out["jobs"] if r["jid"] == "e1")
+    assert abs(row["kwh"] - 0.3) < 0.005
+    assert abs(row["dollars"] - 0.06) < 0.005
+
+
+def test_energy_keeps_measured_and_estimated_apart(conn, now):
+    """TDP x util reads low on an idle card, so the two must not be summed."""
+    n = 3600 // INTERVAL + 1
+    seed_samples(conn, "gaivi", "e2", now - 3600, n, power_w=300, power_est_w=100)
+
+    row = next(r for r in queries.energy(conn, days=1)["jobs"] if r["jid"] == "e2")
+    assert abs(row["kwh"] - 0.3) < 0.005
+    assert abs(row["est_kwh"] - 0.1) < 0.005
+
+
+def test_energy_ignores_an_outage_gap(conn, now):
+    """A day the service was down is not a day of billable draw."""
+    seed_samples(conn, "gaivi", "e3", now - 86400, 2, power_w=1000)
+    seed_samples(conn, "gaivi", "e3", now - 60, 2, power_w=1000)
+
+    row = next(r for r in queries.energy(conn, days=2)["jobs"] if r["jid"] == "e3")
+    assert row["kwh"] < 2 * queries.CAP_S * 1000 / 3600.0 / 1000.0
+
+
+def test_energy_sums_raw_and_rolled_up(conn, now):
+    hour = (now - 10 * 86400) // 3600 * 3600
+    conn.execute("INSERT INTO samples_hourly (hour,cluster,jid,util,gpu_used,gpu_n,n,dt_s,"
+                 "power_w) VALUES (?,'gaivi','e4',100,8192,1,180,3600,500)", (hour,))
+    conn.commit()
+
+    row = next(r for r in queries.energy(conn, days=30)["jobs"] if r["jid"] == "e4")
+    assert abs(row["kwh"] - 0.5) < 0.005
+
+
+def test_a_job_with_no_power_reading_is_left_out(conn, now):
+    seed_samples(conn, "gaivi", "e5", now - 3600, 10)
+    assert not [r for r in queries.energy(conn, days=1)["jobs"] if r["jid"] == "e5"]
+
+
+# ------------------------------------------------------- memory efficiency --
+
+def test_mem_units_parse():
+    assert queries.parse_mem_mib("56G") == 56 * 1024
+    assert abs(queries.parse_mem_mib("39452548K") - 38527.9) < 0.1
+    assert queries.parse_mem_mib("512M") == 512
+    assert queries.parse_mem_mib("4Gn") == 4096      # older Slurm per-node suffix
+    assert queries.parse_mem_mib("") is None
+    assert queries.parse_mem_mib("0") is None
+
+
+def test_mem_efficiency_ranks_the_worst_fit_first(conn, now):
+    for jid, req, rss in (("m1", "56G", "39452548K"), ("m2", "160G", "8388608K")):
+        conn.execute(
+            "INSERT INTO finished (cluster,jid,name,state,end_ts,first_written,"
+            "req_mem,max_rss) VALUES ('gaivi',?,?, 'COMPLETED',?,?,?,?)",
+            (jid, jid, now - 600, now - 600, req, rss))
+    conn.commit()
+
+    rows = queries.mem_efficiency(conn, days=7)
+    assert [r["jid"] for r in rows] == ["m2", "m1"]
+    assert abs(rows[1]["pct"] - 67.2) < 0.5
+
+
+def test_a_job_predating_the_mem_columns_is_skipped(conn, now):
+    conn.execute("INSERT INTO finished (cluster,jid,state,end_ts,first_written) "
+                 "VALUES ('gaivi','old','COMPLETED',?,?)", (now - 600, now - 600))
+    conn.commit()
+    assert not [r for r in queries.mem_efficiency(conn, days=7) if r["jid"] == "old"]
+
+
+# ------------------------------------------------------------ cluster_stats --
+
+def _seed_cluster(conn, ts, partition="ALL", running=10, pending=2, gpus_alloc=40):
+    conn.execute(
+        "INSERT OR REPLACE INTO cluster_samples (ts,cluster,partition,running,pending,"
+        "other,nodes_total,nodes_alloc,nodes_idle,nodes_mixed,nodes_down,cpus_alloc,"
+        "cpus_idle,cpus_total,gpus_total,gpus_alloc,gpu_models,n) "
+        "VALUES (?,'gaivi',?,?,?,0,24,1,14,8,1,322,1752,2200,99,?,'{\"A100\": 15}',1)",
+        (ts, partition, running, pending, gpus_alloc))
+    conn.commit()
+
+
+def test_cluster_stats_splits_the_total_from_the_partitions(conn, now):
+    _seed_cluster(conn, now - 40)
+    _seed_cluster(conn, now - 40, partition="general", running=9, gpus_alloc=14)
+
+    d = queries.cluster_stats(conn, days=1)["gaivi"]
+    assert d["total"]["running"] == 10
+    assert [p["partition"] for p in d["partitions"]] == ["general"]
+    assert d["total"]["gpu_models"] == {"A100": 15}
+
+
+def test_cluster_stats_reports_only_the_newest_row(conn, now):
+    _seed_cluster(conn, now - 600, running=1)
+    _seed_cluster(conn, now - 20, running=7)
+    assert queries.cluster_stats(conn, days=1)["gaivi"]["total"]["running"] == 7
+
+
+def test_the_load_series_averages_without_truncating(conn, now):
+    """Three samples in one bucket average to 20.33, and integer division would
+    render that as a flat 20."""
+    base = (now - 60) // 300 * 300 + 10          # inside one bucket
+    for i, running in enumerate((10, 20, 31)):
+        _seed_cluster(conn, base + i, running=running)
+
+    s = queries.cluster_stats(conn, days=1, bucket_s=300)["gaivi"]["series"]
+    assert s["running"] == [20.3]
+
+
+def test_live_draw_is_the_newest_reading_not_an_arbitrary_one(conn, now):
+    """The panel's watts must match what the card reports now, so an older
+    sample in the same window must not win."""
+    for i, w in enumerate((900.0, 292.3)):
+        conn.execute(
+            "INSERT INTO samples (ts,cluster,jid,state,gpu_n,power_w) "
+            "VALUES (?,'gaivi','470338_2','R',1,?)", (now - 60 + i * 40, w))
+    conn.commit()
+
+    jobs = queries.energy(conn, days=1)["jobs"]
+    assert [j["watts"] for j in jobs] == [292.3]

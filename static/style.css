@@ -68,6 +68,11 @@ tr.sel td { background:color-mix(in srgb, var(--blue) 14%, transparent); }
          white-space:nowrap; }
 .stats { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
 
+.meter { margin-bottom:10px; }
+.meter-head { display:flex; justify-content:space-between; font-size:11px;
+              margin-bottom:3px; }
+.meter .bar { height:8px; }
+
 .alert { display:flex; gap:10px; align-items:center; padding:6px 8px;
          border-left:3px solid var(--yellow); background:var(--line);
          border-radius:0 4px 4px 0; margin-bottom:6px; }
@@ -118,7 +123,8 @@ svg.spark { display:block; }
   nav button { padding:6px 9px; }
   .grid { grid-template-columns:1fr; gap:10px; }
   .card { padding:10px; }
-  #jobtable, #waste-table, #waits, #finished { overflow-x:auto; }
+  #jobtable, #waste-table, #waits, #finished, #memeff,
+  .scroll-x { overflow-x:auto; }
   .gantt .lbl { width:110px; }
   .stat b { font-size:16px; }
 

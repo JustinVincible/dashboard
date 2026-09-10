@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-cluster live Slurm dashboard (gaivi + iruka2 + whatever you add).
+"""Multi-cluster live Slurm dashboard.
 
 What it does per refresh, for every configured cluster IN PARALLEL, in exactly
 ONE ssh round-trip each:
@@ -18,7 +18,7 @@ fires a macOS notification the first time each alert appears.
 Usage:
   jobdash.py                       # live loop, every 20s
   jobdash.py --once                # single draw (scriptable / pipeable)
-  jobdash.py --cluster gaivi       # restrict to one cluster (repeatable)
+  jobdash.py --cluster NAME        # restrict to one cluster (repeatable)
   jobdash.py --history 3           # finished-jobs panel, last 3 days
   jobdash.py --logs                # resolved log paths only (old jobs.py mode)
   jobdash.py --fetch ./logs        # scp every resolved log locally
@@ -64,21 +64,32 @@ notify = false           # macOS notification on new alerts (osascript)
 # notify_url = "https://ntfy.sh/your-topic"   # also POST new alerts here.
 # A Slack or Discord webhook URL is sent as JSON; anything else as plain text.
 metric_points = 120      # max metric samples pulled per job for the sparkline
+price_per_kwh = 0.12     # electricity rate, for the energy panel
 
-# One [[cluster]] block per machine. `host` is an ssh alias from ~/.ssh/config.
+# One [[cluster]] block per machine. Edit these before the first run.
+# `host` is an ssh alias from ~/.ssh/config; `user` is your account there.
 [[cluster]]
-name = "gaivi"
-host = "gaivi"
-user = "jmcmillen"
+name = "mycluster"
+host = "mycluster"
+user = "myusername"
 # Regexes with ONE capture group, matched against the whole log.
 # The first key is the one that gets the sparkline.
 metrics = { loss = "loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)" }
 
-[[cluster]]
-name = "iruka2"
-host = "iruka2"
-user = "j-mcmillen"
-metrics = { loss = "loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)" }
+# A second cluster where the GPU probe is blocked or slow.
+# [[cluster]]
+# name = "othercluster"
+# host = "othercluster"
+# user = "myusername"
+# gpu = false
+
+# A workstation with no scheduler. Every tmux pane running something counts as
+# a job; see tmuxhost.py for how the columns map.
+# [[cluster]]
+# name = "workstation"
+# host = "workstation"
+# user = "myusername"
+# kind = "tmux"
 """
 
 
@@ -87,6 +98,7 @@ class Cluster:
     name: str
     host: str
     user: str
+    kind: str = "slurm"           # "slurm" | "tmux" (a workstation, see tmuxhost.py)
     metrics: dict = field(default_factory=lambda: {"loss": r"loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)"})
     connect_timeout: int = 15     # ssh ConnectTimeout
     command_timeout: int = 60     # wall-clock budget for the whole remote script
@@ -107,15 +119,14 @@ class Settings:
     notify: bool = False
     notify_url: str = ""          # ntfy topic or Slack/Discord webhook, "" to skip
     metric_points: int = 120
+    price_per_kwh: float = 0.12   # what a kWh costs, for the energy panel
     clusters: list = field(default_factory=list)
 
 
 def load_config() -> Settings:
     if not CONFIG_PATH.exists():
-        return Settings(clusters=[
-            Cluster("gaivi", "gaivi", "jmcmillen"),
-            Cluster("iruka2", "iruka2", "j-mcmillen"),
-        ])
+        sys.exit(f"no config at {CONFIG_PATH} — run `collector.py --write-config` "
+                 f"and edit the [[cluster]] blocks in it")
     if tomllib is None:
         sys.exit("python 3.11+ required to read the TOML config")
     data = tomllib.loads(CONFIG_PATH.read_text())
@@ -128,7 +139,7 @@ def load_config() -> Settings:
             user=c["user"],
             metrics=c.get("metrics") or Cluster.metrics.default_factory(),  # type: ignore[attr-defined]
             **{k: v for k, v in c.items()
-               if k in ("connect_timeout", "command_timeout", "batch_mode",
+               if k in ("kind", "connect_timeout", "command_timeout", "batch_mode",
                         "multiplex", "gpu", "gpu_timeout", "ssh_opts")},
         ))
     if not s.clusters:
@@ -222,7 +233,8 @@ SQ_FMT = "%.18i|%.14P|%.34j|%.2t|%.10M|%.10L|%A|%R"
 
 
 def build_remote_script(user: str, metric_re: str, points: int, history_days: int,
-                        want_gpu: bool, want_logs: bool, gpu_timeout: int = 12) -> str:
+                        want_gpu: bool, want_logs: bool, gpu_timeout: int = 12,
+                        want_cluster: bool = True, want_mem: bool = True) -> str:
     """One script, one round-trip: squeue, then per-running-job detail in
     parallel subshells, then sacct history. A serial per-job ssh costs ~1-2s of
     channel setup each; batching keeps a refresh flat regardless of job count.
@@ -242,21 +254,25 @@ def build_remote_script(user: str, metric_re: str, points: int, history_days: in
 
     gpu_block = ''
     if want_gpu:
-        q = ('nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu '
-             '--format=csv,noheader,nounits')
+        # power.draw is what the board is actually pulling; name keys the TDP
+        # fallback for cards that report it as [N/A].
+        q = ('nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,'
+             'power.draw,power.limit,name --format=csv,noheader,nounits')
         gpu_block = (
             # Attempt 1: a job step inside the allocation. Captures stderr so a
             # refusal ("Requested nodes are busy", "job step creation temporarily
             # disabled") is reported instead of lost.
-            '  gpu=$(TO_ srun --overlap --quiet --jobid=$real ' + q + ' 2>&1 | head -4 | tr "\\n" ";")\n'
+            '  gpu=$(TO_ srun --overlap --quiet --jobid=$real ' + q + ' 2>&1 | head -8 | tr "\\n" ";")\n'
             # Attempt 2: many clusters let you ssh a node you hold an allocation
-            # on, and it costs nothing when attempt 1 already worked.
+            # on, and it costs nothing when attempt 1 already worked. It runs
+            # outside the job step, so it sees every card on the node -- the
+            # scope marker keeps that distinguishable downstream.
             '  case "$gpu" in\n'
             '    *[0-9]*,*[0-9]*,*[0-9]*) ;;\n'
             '    *) if [ -n "$node" ]; then\n'
             '         gpu2=$(TO_ ssh -o BatchMode=yes -o ConnectTimeout=5 '
-            '-o StrictHostKeyChecking=no "$node" ' + shlex.quote(q) + ' 2>&1 | head -4 | tr "\\n" ";")\n'
-            '         case "$gpu2" in *[0-9]*,*[0-9]*,*[0-9]*) gpu="$gpu2" ;; esac\n'
+            '-o StrictHostKeyChecking=no "$node" ' + shlex.quote(q) + ' 2>&1 | head -8 | tr "\\n" ";")\n'
+            '         case "$gpu2" in *[0-9]*,*[0-9]*,*[0-9]*) gpu="$gpu2"; scope=node ;; esac\n'
             '       fi ;;\n'
             '  esac\n'
         )
@@ -278,6 +294,35 @@ def build_remote_script(user: str, metric_re: str, points: int, history_days: in
             '  fi\n'
         )
 
+    # Cluster-wide state, aggregated remotely. Shipping raw squeue for a busy
+    # cluster every 20s would undo the round-trip budget this script exists for.
+    cluster_block = ''
+    if want_cluster:
+        cluster_block = (
+            'echo "@@QUEUE"\n'
+            "squeue -h -o '%T|%P' 2>/dev/null | sort | uniq -c\n"
+            'echo "@@SINFO"\n'
+            "sinfo -h -O 'Partition:24,StateLong:16,Nodes:8,CPUsState:20,"
+            "Gres:40,GresUsed:40' 2>/dev/null\n"
+            # A node belongs to several partitions, so the view above counts it
+            # once per partition. The per-node view, deduped on node name, is
+            # what the cluster totals are built from.
+            'echo "@@NODES"\n'
+            "sinfo -h -N -O 'NodeList:24,StateLong:16,CPUsState:20,Gres:40,"
+            "GresUsed:40' 2>/dev/null | awk '!seen[$1]++'\n"
+        )
+
+    # MaxRSS lives on the .batch step and ReqMem on the allocation line, so this
+    # cannot ride on the -X history query below. The grep drops the srun steps.
+    mem_block = ''
+    if want_mem:
+        keep = shlex.quote(r'^[0-9][0-9_]*(\.batch)?\|')
+        mem_block = (
+            'echo "@@MEM"\n'
+            'sacct -u ' + user + ' -S now-' + str(history_days) + 'days -n -P '
+            '-o JobID,ReqMem,MaxRSS 2>/dev/null | grep -E ' + keep + ' | tail -600\n'
+        )
+
     body = (
         # `timeout` is coreutils and not universal; degrade to running bare
         # rather than failing every command with "TO_: not found".
@@ -288,13 +333,14 @@ def build_remote_script(user: str, metric_re: str, points: int, history_days: in
         'echo "@@DETAIL"\n'
         'for real in $(squeue -u ' + user + " -h -o '%A' -t R); do\n"
         '(\n'
-        '  gpu=""; node=""; latest=""; lastline=""; mtime=0; errs=""; series=""\n'
+        '  gpu=""; node=""; latest=""; lastline=""; mtime=0; errs=""; series=""; scope=job\n'
         + info_block + gpu_block + log_block +
-        '  printf "%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s\\n" '
-        '"$real" "$gpu" "$(basename "$latest" 2>/dev/null)" "$mtime" "$errs" "$series" "$node" "$lastline"\n'
+        '  printf "%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s' + FS + '%s\\n" '
+        '"$real" "$gpu" "$(basename "$latest" 2>/dev/null)" "$mtime" "$errs" "$series" "$node" "$lastline" "$scope"\n'
         ') &\n'
         'done\n'
         'wait\n'
+        + cluster_block +
         'echo "@@SACCT"\n'
         # Submit and Start make queue waits exact. A job that pends and starts
         # between two polls is invisible to the observed transition, which is
@@ -302,6 +348,7 @@ def build_remote_script(user: str, metric_re: str, points: int, history_days: in
         'sacct -u ' + user + ' -S now-' + str(history_days) + 'days -X -n -P '
         '-o JobID,JobName%40,State,Elapsed,ExitCode,End,MaxRSS,Submit,Start '
         '2>/dev/null | tail -300\n'
+        + mem_block +
         'echo "@@NOW"\n'
         'date +%s\n'
     )
@@ -312,6 +359,14 @@ JID_OK = re.compile(r"^[0-9][0-9_\[\]\-]*$")
 
 
 def log_tail(cl: Cluster, jid: str, lines: int = 80) -> tuple[str, str]:
+    """Last N lines of a running job's log, from whichever backend owns it."""
+    if cl.kind == "tmux":
+        import tmuxhost
+        return tmuxhost.log_tail(cl, jid, lines)
+    return log_tail_slurm(cl, jid, lines)
+
+
+def log_tail_slurm(cl: Cluster, jid: str, lines: int = 80) -> tuple[str, str]:
     """Fetch the last N lines of a running job's log. -> (path, text).
 
     On demand only. Shipping this many lines for every job on every tick would
@@ -347,28 +402,200 @@ def log_tail(cl: Cluster, jid: str, lines: int = 80) -> tuple[str, str]:
     return path, "\n".join(out)
 
 
+# Board TDP in watts, keyed by a substring of the nvidia-smi model name. Used
+# only when the card will not report power.draw; matched longest-first so
+# "A100-SXM4-80GB" does not fall through to a shorter "A100" entry.
+TDP_W = {
+    "H100": 700, "A100-SXM4-80GB": 400, "A100-SXM4": 400, "A100-PCIE": 250,
+    "A100": 300, "A40": 300, "A6000": 300, "RTXPRO6000": 600, "6000ADA": 300,
+    "TITANRTX": 280, "TITAN RTX": 280, "2080TI": 250, "1080TI": 250,
+    "V100": 300, "L40S": 350, "L40": 300, "T4": 70,
+}
+
+
+def tdp_for(name: str) -> int | None:
+    """Board TDP for a model name, or None when the model is unknown."""
+    n = (name or "").upper().replace("NVIDIA ", "").replace("-", "")
+    for key in sorted(TDP_W, key=len, reverse=True):
+        if key.replace("-", "").replace(" ", "") in n.replace(" ", ""):
+            return TDP_W[key]
+    return None
+
+
+def _num(x: str) -> float | None:
+    """nvidia-smi writes an unsupported field as [N/A], so fields are checked
+    one at a time rather than all-or-nothing across the row."""
+    x = x.strip()
+    try:
+        return float(x)
+    except ValueError:
+        return None
+
+
 def parse_gpu(raw: str):
     """`nvidia-smi` csv, possibly several GPUs, possibly an error message.
 
-    Returns (stats, error_text). stats is (used_mib, total_mib, mean_util)
-    summed across the GPUs the job holds; error_text is whatever non-numeric
-    complaint came back instead.
+    Returns (stats, error_text). stats is
+    (used_mib, total_mib, mean_util, n_gpus, watts, est_watts, name), summed
+    across the GPUs the job holds; error_text is whatever non-numeric complaint
+    came back instead.
+
+    Rows are 6 fields now (memory, util, power.draw, power.limit, name) and 3 in
+    older captures, so both widths parse. `watts` is measured and stays None
+    unless every card reported it; `est_watts` is TDP x util and is kept
+    separate so an estimate is never summed into a measurement.
     """
     used = total = 0
-    utils = []
+    utils, watts, est = [], [], []
+    name = ""
     for chunk in raw.split(";"):
         f = [x.strip() for x in chunk.split(",")]
-        if len(f) == 3 and all(x.replace(".", "", 1).isdigit() and x for x in f):
-            used += int(float(f[0]))
-            total += int(float(f[1]))
-            utils.append(float(f[2]))
+        if len(f) not in (3, 6):
+            continue
+        u, t, ut = _num(f[0]), _num(f[1]), _num(f[2])
+        if u is None or t is None or ut is None:
+            continue
+        used += int(u)
+        total += int(t)
+        utils.append(ut)
+        if len(f) == 6:
+            name = name or f[5]
+            w = _num(f[3])
+            if w is not None:
+                watts.append(w)
+            tdp = tdp_for(f[5]) or _num(f[4])
+            if tdp:
+                est.append(tdp * ut / 100.0)
+
     if utils:
-        return (used, total, int(sum(utils) / len(utils)), len(utils)), ""
+        # A partial power reading would understate the total, so it is dropped.
+        measured = round(sum(watts), 1) if len(watts) == len(utils) else None
+        estimated = round(sum(est), 1) if len(est) == len(utils) else None
+        return (used, total, int(sum(utils) / len(utils)), len(utils),
+                measured, estimated, name), ""
     msg = " ".join(raw.replace(";", " ").split())
     if not msg:
         return None, ""
     msg = re.sub(r"^srun:\s*", "", msg)
     return None, msg[:70]
+
+
+GRES_RE = re.compile(r"gpu:([A-Za-z0-9_.\-]+):(\d+)")
+
+
+def _gres_counts(field: str) -> dict:
+    """`gpu:A100:3` / `gpu:A100:2(IDX:0,2)` -> {"A100": 3}. A node with no GPUs
+    reports "(null)"."""
+    out: dict = {}
+    for model, n in GRES_RE.findall(field or ""):
+        out[model] = out.get(model, 0) + int(n)
+    return out
+
+
+IDLE_STATES = ("idle",)
+BUSY_STATES = ("allocated", "mixed", "completing")
+
+
+def parse_cluster(queue_lines: list, sinfo_lines: list, node_lines: list) -> dict:
+    """Cluster-wide queue and node state -> {partition: row}.
+
+    Split out of collect() so it is testable against captured output with no
+    ssh, the way tmuxhost.parse() already is.
+
+    sinfo emits one row per partition+state pair, so partitions repeat and are
+    folded into one row here. The default partition carries a trailing "*".
+    A pending job may name several partitions ("Quick,Contributors"); it counts
+    toward each.
+
+    The synthetic "ALL" row is built from the deduped per-node view, not by
+    summing partitions -- a node in three partitions would be counted three
+    times.
+    """
+    parts: dict = {}
+
+    def row(name):
+        return parts.setdefault(name, {
+            "partition": name, "running": 0, "pending": 0, "other": 0,
+            "nodes_total": 0, "nodes_alloc": 0, "nodes_idle": 0,
+            "nodes_mixed": 0, "nodes_down": 0,
+            "cpus_alloc": 0, "cpus_idle": 0, "cpus_total": 0,
+            "gpus_total": 0, "gpus_alloc": 0, "gpu_models": {},
+        })
+
+    total = row("ALL")
+    for line in queue_lines:
+        f = line.split()
+        if len(f) != 2 or not f[0].isdigit():
+            continue
+        n, rest = int(f[0]), f[1]
+        state, _, plist = rest.partition("|")
+        key = {"RUNNING": "running", "PENDING": "pending"}.get(state.strip(), "other")
+        total[key] += n
+        for part in plist.split(","):
+            part = part.strip().rstrip("*")
+            if part:
+                row(part)[key] += n
+
+    def add_nodes(r, state, n, cpus, gres, used):
+        r["nodes_total"] += n
+        if state.startswith("idle"):
+            r["nodes_idle"] += n
+        elif state.startswith("mix"):
+            r["nodes_mixed"] += n
+        elif state.startswith(("alloc", "completing")):
+            r["nodes_alloc"] += n
+        else:                       # down, drained, draining, reserved, ...
+            r["nodes_down"] += n
+        a, i, _o, t = (cpus.split("/") + ["0"] * 4)[:4]
+        r["cpus_alloc"] += int(a) * n if a.isdigit() else 0
+        r["cpus_idle"] += int(i) * n if i.isdigit() else 0
+        r["cpus_total"] += int(t) * n if t.isdigit() else 0
+        for model, c in _gres_counts(gres).items():
+            r["gpus_total"] += c * n
+            r["gpu_models"][model] = r["gpu_models"].get(model, 0) + c * n
+        r["gpus_alloc"] += sum(_gres_counts(used).values()) * n
+
+    # Partition rows: Partition StateLong Nodes CPUsState Gres GresUsed
+    for line in sinfo_lines:
+        f = line.split()
+        if len(f) < 4 or not f[2].isdigit():
+            continue
+        f += [""] * (6 - len(f))
+        add_nodes(row(f[0].rstrip("*")), f[1].lower(), int(f[2]), f[3], f[4], f[5])
+
+    # Cluster totals: NodeList StateLong CPUsState Gres GresUsed, one per node.
+    for line in node_lines:
+        f = line.split()
+        if len(f) < 3:
+            continue
+        f += [""] * (5 - len(f))
+        add_nodes(total, f[1].lower(), 1, f[2], f[3], f[4])
+
+    return parts
+
+
+def parse_mem(lines: list) -> dict:
+    """`sacct -o JobID,ReqMem,MaxRSS` -> {jid: (req_mem, max_rss)}.
+
+    ReqMem sits on the allocation line and MaxRSS on the .batch step, so the two
+    halves are joined on the base job id. Either half may be missing while the
+    job is still running.
+    """
+    out: dict = {}
+    for line in lines:
+        f = line.split("|")
+        if len(f) < 3:
+            continue
+        jid, req, rss = f[0].strip(), f[1].strip(), f[2].strip()
+        base = jid.split(".")[0]
+        if not base:
+            continue
+        cur = out.setdefault(base, ["", ""])
+        if req:
+            cur[0] = req
+        if rss:
+            cur[1] = rss
+    return {k: tuple(v) for k, v in out.items() if v[0] or v[1]}
 
 
 @dataclass
@@ -382,8 +609,10 @@ class Job:
     timeleft: str
     real: str
     reason: str
-    gpu: tuple | None = None       # (used_mib, total_mib, mean_util_pct, n_gpus)
+    # (used_mib, total_mib, mean_util_pct, n_gpus, watts, est_watts, gpu_name)
+    gpu: tuple | None = None
     gpu_err: str = ""              # why the GPU query came back empty
+    gpu_scope: str = "job"         # "node" when the reading covers the whole box
     node: str = ""
     log: str | None = None
     mtime: int = 0
@@ -401,6 +630,8 @@ class Snapshot:
     remote_now: int = 0
     error: str = ""
     warn: str = ""
+    cluster_stats: dict = field(default_factory=dict)   # partition -> counts
+    mem: dict = field(default_factory=dict)             # jid -> (req_mem, max_rss)
 
 
 SACCT_FIELDS = 9   # JobID,JobName,State,Elapsed,ExitCode,End,MaxRSS,Submit,Start
@@ -420,7 +651,18 @@ def split_sacct(line: str) -> list[str]:
     return f
 
 
-def collect(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool, history_days: int) -> Snapshot:
+def collect(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool,
+            history_days: int) -> Snapshot:
+    """One refresh of one machine. `kind` picks the backend; the Snapshot it
+    returns is the same shape either way, so nothing downstream branches."""
+    if cl.kind == "tmux":
+        import tmuxhost
+        return tmuxhost.collect(cl, st, want_gpu, want_logs)
+    return collect_slurm(cl, st, want_gpu, want_logs, history_days)
+
+
+def collect_slurm(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool,
+                  history_days: int) -> Snapshot:
     want_gpu = want_gpu and cl.gpu
     metric_re = next(iter(cl.metrics.values()))
     script = build_remote_script(cl.user, metric_re, st.metric_points, history_days,
@@ -430,12 +672,14 @@ def collect(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool, history_
         return Snapshot(cl.name, False, error=res.reason)
     out = res.out
 
-    sections, cur = {"SQUEUE": [], "DETAIL": [], "SACCT": [], "NOW": []}, None
+    sections = {k: [] for k in ("SQUEUE", "DETAIL", "QUEUE", "SINFO", "NODES",
+                                "SACCT", "MEM", "NOW")}
+    cur = None
     for line in out.splitlines():
         if line.startswith("@@"):
             cur = line[2:]
             continue
-        if cur:
+        if cur in sections:
             sections[cur].append(line)
 
     jobs = []
@@ -448,13 +692,14 @@ def collect(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool, history_
     by_real = {j.real: j for j in jobs}
     for line in sections["DETAIL"]:
         f = line.split(FS)
-        if len(f) != 8:
+        if len(f) != 9:
             continue
-        real, gpu_raw, logname, mtime, errs, series, node, lastline = f
+        real, gpu_raw, logname, mtime, errs, series, node, lastline, scope = f
         j = by_real.get(real.strip())
         if not j:
             continue
         j.gpu, j.gpu_err = parse_gpu(gpu_raw)
+        j.gpu_scope = scope.strip() or "job"
         j.node = node.strip()
         j.log = logname or None
         j.mtime = int(mtime) if mtime.strip().isdigit() else 0
@@ -474,7 +719,10 @@ def collect(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool, history_
         # Connected fine but the remote script complained — do not silently
         # render this as "nothing queued".
         warn = res.err.splitlines()[0][:120]
-    return Snapshot(cl.name, True, jobs, finished, now, warn=warn)
+    return Snapshot(cl.name, True, jobs, finished, now, warn=warn,
+                    cluster_stats=parse_cluster(sections["QUEUE"], sections["SINFO"],
+                                                sections["NODES"]),
+                    mem=parse_mem(sections["MEM"]))
 
 
 # ---------------------------------------------------------------- alerts ----
@@ -679,6 +927,9 @@ def resolve_logs(clusters, fetch: str | None):
     """Old jobs.py behaviour: print resolved log paths, optionally scp them."""
     for cl in clusters:
         print(f"\n=== {cl.name} ===")
+        if cl.kind == "tmux":
+            print("  n/a — tmux jobs resolve their log from fd 1, not from scontrol")
+            continue
         res = ssh(cl.host, f"""
 for real in $(squeue -u {cl.user} -h -o '%A' -t R); do
   stdout=$(scontrol show job $real 2>/dev/null | tr " " "\\n" | sed -n "s/^StdOut=//p")
@@ -703,17 +954,31 @@ done""", timeout=cl.command_timeout, opts=ssh_opts_for(cl))
             print(f"  fetched into {dest}")
 
 
+SLURM_PROBES = [
+    ("connect", "echo ok"),
+    ("shell/PATH", "echo $SHELL; command -v squeue || echo 'squeue NOT on PATH'"),
+    ("squeue", "squeue -u $USER -h -o '%i %t' | head -3; echo '(rc='$?')'"),
+    ("sacct", "sacct -u $USER -S now-1days -X -n -P -o JobID,State 2>&1 | head -3"),
+    ("scontrol", "scontrol show config 2>/dev/null | head -1"),
+]
+
+TMUX_PROBES = [
+    ("connect", "echo ok"),
+    ("shell/PATH", "echo $SHELL; command -v tmux || echo 'tmux NOT on PATH'"),
+    ("tmux", "tmux list-sessions 2>&1 | head -5; echo '(rc='$?')'"),
+    ("panes", "tmux list-panes -a -F '#{session_name} #{pane_pid} #{pane_current_command}' "
+              "2>&1 | head -5"),
+    ("nvidia-smi", "nvidia-smi --query-gpu=index,utilization.gpu "
+                   "--format=csv,noheader,nounits 2>&1 | head -4"),
+    ("proc", "test -r /proc/$$/stat && echo '/proc readable' || echo '/proc NOT readable'"),
+]
+
+
 def check(clusters):
-    """Isolate WHERE a cluster breaks: connection, then each remote command."""
-    probes = [
-        ("connect", "echo ok"),
-        ("shell/PATH", "echo $SHELL; command -v squeue || echo 'squeue NOT on PATH'"),
-        ("squeue", "squeue -u $USER -h -o '%i %t' | head -3; echo '(rc='$?')'"),
-        ("sacct", "sacct -u $USER -S now-1days -X -n -P -o JobID,State 2>&1 | head -3"),
-        ("scontrol", "scontrol show config 2>/dev/null | head -1"),
-    ]
+    """Isolate WHERE a machine breaks: connection, then each remote command."""
     for cl in clusters:
-        print(f"\n=== {cl.name} ({cl.host}, user {cl.user}) ===")
+        probes = TMUX_PROBES if cl.kind == "tmux" else SLURM_PROBES
+        print(f"\n=== {cl.name} ({cl.host}, user {cl.user}, {cl.kind}) ===")
         opts = ssh_opts_for(cl)
         print(f"  ssh flags: {' '.join(opts)}")
         for label, cmd in probes:
@@ -727,10 +992,14 @@ def check(clusters):
                 body = " | ".join(l.strip() for l in res.out.splitlines() if l.strip())[:150]
                 print(f"  {label:<12} ok    {body}")
         # The real thing, timed.
+        metric_re = next(iter(cl.metrics.values()))
+        if cl.kind == "tmux":
+            import tmuxhost
+            script = tmuxhost.build_script(metric_re, 20, cl.gpu, True)
+        else:
+            script = build_remote_script(cl.user, metric_re, 20, 1, cl.gpu, True)
         t0 = time.time()
-        res = ssh(cl.host, build_remote_script(cl.user, next(iter(cl.metrics.values())),
-                                               20, 1, cl.gpu, True),
-                  timeout=cl.command_timeout, opts=opts)
+        res = ssh(cl.host, script, timeout=cl.command_timeout, opts=opts)
         dt = time.time() - t0
         print(f"  full script  {'ok' if res.ok else 'FAIL'}  {dt:.1f}s"
               f"{'' if res.ok else '  ' + res.reason}")

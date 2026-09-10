@@ -2,22 +2,22 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.jmcmillen.jobdash</string>
+  <key>Label</key><string>com.jobdash</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/justinmcmillen/PycharmProjects/Dashboard/.venv/bin/python</string>
-    <string>/Users/justinmcmillen/PycharmProjects/Dashboard/app.py</string>
+    <string>__PROJECT_DIR__/.venv/bin/python</string>
+    <string>__PROJECT_DIR__/app.py</string>
     <string>--host</string><string>127.0.0.1</string>
-    <string>--port</string><string>8787</string>
+    <string>--port</string><string>__PORT__</string>
   </array>
 
-  <key>WorkingDirectory</key><string>/Users/justinmcmillen/PycharmProjects/Dashboard</string>
+  <key>WorkingDirectory</key><string>__PROJECT_DIR__</string>
 
   <!-- launchd hands over a thin environment; ssh needs HOME to find ~/.ssh. -->
   <key>EnvironmentVariables</key>
   <dict>
-    <key>HOME</key><string>/Users/justinmcmillen</string>
+    <key>HOME</key><string>__HOME__</string>
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
   </dict>
 
@@ -25,7 +25,7 @@
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>15</integer>
 
-  <key>StandardOutPath</key><string>/Users/justinmcmillen/Library/Logs/jobdash.log</string>
-  <key>StandardErrorPath</key><string>/Users/justinmcmillen/Library/Logs/jobdash.err</string>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/jobdash.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/jobdash.err</string>
 </dict>
 </plist>

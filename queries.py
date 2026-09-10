@@ -6,6 +6,7 @@ CAP_S so a service outage does not get billed as continuous GPU time.
 """
 from __future__ import annotations
 
+import json
 import time
 
 from store import GAP_CAP_S as CAP_S
@@ -244,3 +245,214 @@ def alert_history(conn, days: float = 14, limit: int = 200) -> list:
         "SELECT * FROM alerts WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT ?",
         (_since(days), limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+# ------------------------------------------------------------- energy ----
+
+def energy(conn, days: float = 7, price_per_kwh: float = 0.12) -> dict:
+    """Energy drawn by GPUs, per cluster and per job.
+
+    Same capped-gap integration as gpu_hours: a sample's wattage is held over
+    the interval since the previous sample, and a gap longer than CAP_S is
+    treated as downtime rather than billed.
+
+    Measured and estimated are returned apart. TDP x util is a rough proxy that
+    reads low at low utilization -- an idle A100 still pulls 40-60 W -- so
+    adding it into a measured total would quietly corrupt the number.
+    """
+    since = _since(days)
+    acc: dict = {}
+
+    def add(cluster, jid, kwh, est_kwh):
+        d = acc.setdefault((cluster, jid), {
+            "cluster": cluster, "jid": jid, "name": "", "kwh": 0.0,
+            "est_kwh": 0.0, "watts": None, "est_watts": None,
+            "gpu_name": "", "scope": "job"})
+        d["kwh"] += kwh
+        d["est_kwh"] += est_kwh
+
+    for r in conn.execute(
+        """
+        WITH s AS (
+          SELECT cluster, jid, ts, power_w, power_est_w,
+                 ts - LAG(ts) OVER (PARTITION BY cluster, jid ORDER BY ts) AS dt
+          FROM samples
+          WHERE ts>=? AND (power_w IS NOT NULL OR power_est_w IS NOT NULL)
+        )
+        SELECT cluster, jid,
+               SUM(MIN(dt, ?) * COALESCE(power_w, 0)) / 3600.0 / 1000.0 AS kwh,
+               SUM(MIN(dt, ?) * COALESCE(power_est_w, 0)) / 3600.0 / 1000.0 AS est_kwh
+        FROM s WHERE dt IS NOT NULL AND dt <= ?
+        GROUP BY cluster, jid
+        """, (since, CAP_S, CAP_S, CAP_S)):
+        add(r["cluster"], r["jid"], r["kwh"] or 0, r["est_kwh"] or 0)
+
+    for r in conn.execute(
+        "SELECT cluster, jid, "
+        "       SUM(dt_s * COALESCE(power_w, 0))/3600.0/1000.0 AS kwh, "
+        "       SUM(dt_s * COALESCE(power_est_w, 0))/3600.0/1000.0 AS est_kwh "
+        "FROM samples_hourly WHERE hour>=? "
+        "  AND (power_w IS NOT NULL OR power_est_w IS NOT NULL) "
+        "GROUP BY cluster, jid", (since,)):
+        add(r["cluster"], r["jid"], r["kwh"] or 0, r["est_kwh"] or 0)
+
+    # Live draw comes off the newest sample rather than the integration, so the
+    # panel shows what the cards are pulling now, not an average. The row is
+    # named by an explicit correlated MAX rather than by bare columns beside an
+    # aggregate, which only happens to work in SQLite.
+    for r in conn.execute(
+        "SELECT cluster, jid, ts, power_w, power_est_w, gpu_name, gpu_scope "
+        "FROM samples s WHERE ts>=? AND state='R' AND ts = ("
+        "  SELECT MAX(ts) FROM samples i "
+        "   WHERE i.cluster=s.cluster AND i.jid=s.jid AND i.state='R')",
+        (_since(0.02),)):
+        d = acc.get((r["cluster"], r["jid"]))
+        if d is not None:
+            d["watts"] = r["power_w"]
+            d["est_watts"] = r["power_est_w"]
+            d["gpu_name"] = r["gpu_name"] or ""
+            d["scope"] = r["gpu_scope"] or "job"
+
+    names = {(r["cluster"], r["jid"]): r["name"] or ""
+             for r in conn.execute("SELECT cluster, jid, name FROM jobs")}
+
+    jobs, clusters = [], {}
+    for key, d in acc.items():
+        if d["kwh"] <= 0 and d["est_kwh"] <= 0:
+            continue
+        d["name"] = names.get(key, "")
+        d["dollars"] = round((d["kwh"] or d["est_kwh"]) * price_per_kwh, 2)
+        jobs.append(d)
+        c = clusters.setdefault(d["cluster"], {
+            "cluster": d["cluster"], "kwh": 0.0, "est_kwh": 0.0,
+            "watts": 0.0, "est_watts": 0.0, "jobs": 0, "node_scoped": 0})
+        c["kwh"] += d["kwh"]
+        c["est_kwh"] += d["est_kwh"]
+        c["watts"] += d.get("watts") or 0
+        c["est_watts"] += d.get("est_watts") or 0
+        c["jobs"] += 1
+        c["node_scoped"] += 1 if d.get("scope") == "node" else 0
+
+    for c in clusters.values():
+        for k in ("kwh", "est_kwh"):
+            c[k] = round(c[k], 3)
+        for k in ("watts", "est_watts"):
+            c[k] = round(c[k])
+        c["dollars"] = round((c["kwh"] or c["est_kwh"]) * price_per_kwh, 2)
+
+    for d in jobs:
+        d["kwh"] = round(d["kwh"], 3)
+        d["est_kwh"] = round(d["est_kwh"], 3)
+
+    return {"price_per_kwh": price_per_kwh,
+            "clusters": sorted(clusters.values(), key=lambda c: -c["kwh"]),
+            "jobs": sorted(jobs, key=lambda d: -(d["kwh"] or d["est_kwh"]))}
+
+
+# ------------------------------------------------------ cluster capacity ----
+
+CLUSTER_COLS = ("running", "pending", "other", "nodes_total", "nodes_alloc",
+                "nodes_idle", "nodes_mixed", "nodes_down", "cpus_alloc",
+                "cpus_idle", "cpus_total", "gpus_total", "gpus_alloc")
+
+
+def cluster_stats(conn, days: float = 1, bucket_s: int = 300) -> dict:
+    """Cluster-wide queue and node state: where each partition stands now, and
+    how the whole cluster's load moved over the window.
+
+    "ALL" is the synthetic whole-cluster partition and is pulled out of the
+    per-partition list, since a node in three partitions is counted in each and
+    the partition rows therefore do not sum to it.
+    """
+    since = _since(days)
+    latest = {}
+    for r in conn.execute(
+        "SELECT c.* FROM cluster_samples c JOIN ("
+        "  SELECT cluster, partition, MAX(ts) AS ts FROM cluster_samples "
+        "  WHERE ts>=? GROUP BY cluster, partition) m "
+        "ON m.cluster=c.cluster AND m.partition=c.partition AND m.ts=c.ts",
+        (since,)):
+        row = {k: r[k] for k in ("ts", "partition", "n", *CLUSTER_COLS)}
+        row["gpu_models"] = json.loads(r["gpu_models"] or "{}")
+        d = latest.setdefault(r["cluster"], {"cluster": r["cluster"],
+                                             "total": None, "partitions": []})
+        if r["partition"] == "ALL":
+            d["total"] = row
+        else:
+            d["partitions"].append(row)
+
+    for d in latest.values():
+        d["partitions"].sort(key=lambda p: (-p["running"], p["partition"]))
+
+    series: dict = {}
+    for r in conn.execute(
+        # *1.0 forces real division. Both operands are INTEGER, and SQLite would
+        # otherwise truncate a mean queue depth of 22.7 to 22.
+        "SELECT cluster, ts/? AS b, "
+        "       SUM(running*n)*1.0/SUM(n) AS running, "
+        "       SUM(pending*n)*1.0/SUM(n) AS pending, "
+        "       SUM(gpus_alloc*n)*1.0/SUM(n) AS gpus_alloc, "
+        "       SUM(gpus_total*n)*1.0/SUM(n) AS gpus_total "
+        "FROM cluster_samples WHERE ts>=? AND partition='ALL' "
+        "GROUP BY cluster, b ORDER BY b", (bucket_s, since)):
+        d = series.setdefault(r["cluster"], {"ts": [], "running": [], "pending": [],
+                                             "gpus_alloc": [], "gpus_total": []})
+        d["ts"].append(r["b"] * bucket_s)
+        for k in ("running", "pending", "gpus_alloc", "gpus_total"):
+            d[k].append(round(r[k] or 0, 1))
+
+    for name, d in latest.items():
+        d["series"] = series.get(name, {"ts": [], "running": [], "pending": [],
+                                        "gpus_alloc": [], "gpus_total": []})
+    return latest
+
+
+# ------------------------------------------------- memory efficiency ----
+
+MEM_UNITS = {"K": 1 / 1024, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024}
+
+
+def parse_mem_mib(raw: str) -> float | None:
+    """sacct memory ("56G", "39452548K", "0") -> MiB.
+
+    ReqMem on Slurm 21.08+ is a plain size; older versions append `n` or `c`
+    for per-node / per-cpu, which is stripped and ignored -- reporting the base
+    figure beats reporting a number scaled by a cpu count we do not have.
+    """
+    t = (raw or "").strip().rstrip("nc")
+    if not t:
+        return None
+    unit = t[-1].upper()
+    if unit in MEM_UNITS:
+        t = t[:-1]
+    else:
+        unit = "M"
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return v * MEM_UNITS[unit] if v else None
+
+
+def mem_efficiency(conn, days: float = 30) -> list:
+    """Per finished job: memory asked for against the peak actually used.
+
+    MaxRSS lives on the .batch step and ReqMem on the allocation line, so both
+    arrive from the collector's separate memory query. Jobs that finished before
+    those columns existed have neither and are left out rather than shown at 0%.
+    """
+    out = []
+    for r in conn.execute(
+        "SELECT cluster, jid, name, state, req_mem, max_rss, end_ts "
+        "FROM finished WHERE COALESCE(first_written, end_ts) >= ? "
+        "  AND req_mem IS NOT NULL AND max_rss IS NOT NULL",
+        (_since(days),)):
+        req, used = parse_mem_mib(r["req_mem"]), parse_mem_mib(r["max_rss"])
+        if not req or used is None:
+            continue
+        out.append({"cluster": r["cluster"], "jid": r["jid"],
+                    "name": r["name"] or "", "state": r["state"],
+                    "end_ts": r["end_ts"],
+                    "req_mib": round(req), "used_mib": round(used),
+                    "pct": round(used / req * 100, 1)})
+    return sorted(out, key=lambda d: d["pct"])

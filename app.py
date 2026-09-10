@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
@@ -54,7 +55,9 @@ def config():
     st = poller.st
     return {"interval": st.interval, "stall_minutes": st.stall_minutes,
             "low_util_pct": st.low_util_pct, "timeleft_warn_min": st.timeleft_warn_min,
-            "clusters": [c.name for c in st.clusters]}
+            "price_per_kwh": st.price_per_kwh,
+            "clusters": [{"name": c.name, "kind": c.kind, "gpu": c.gpu}
+                         for c in st.clusters]}
 
 
 @app.get("/api/series/{cluster}/{jid}")
@@ -80,6 +83,21 @@ def cluster_util(days: float = 1, bucket: int = 300):
 @app.get("/api/gpu_hours")
 def gpu_hours(days: float = 30):
     return queries.gpu_hours(poller.conn, days)
+
+
+@app.get("/api/clusters")
+def clusters(days: float = 1, bucket: int = 300):
+    return queries.cluster_stats(poller.conn, days, bucket)
+
+
+@app.get("/api/energy")
+def energy(days: float = 7):
+    return queries.energy(poller.conn, days, poller.st.price_per_kwh)
+
+
+@app.get("/api/mem_efficiency")
+def mem_efficiency(days: float = 30):
+    return queries.mem_efficiency(poller.conn, days)
 
 
 @app.get("/api/queue_waits")
@@ -168,4 +186,11 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
     a = ap.parse_args()
+
+    # Fail on a missing config here rather than inside uvicorn's startup, where
+    # the one useful line arrives at the bottom of a traceback.
+    if not collector.CONFIG_PATH.exists():
+        sys.exit(f"no config at {collector.CONFIG_PATH} — run "
+                 f"`collector.py --write-config` and edit the [[cluster]] blocks in it")
+
     uvicorn.run(app, host=a.host, port=a.port, log_level="info")

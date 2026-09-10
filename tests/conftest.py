@@ -27,10 +27,13 @@ def now():
 
 
 def seed_samples(conn, cluster, jid, start_ts, n, util=50, gpu_n=2,
-                 gpu_used=8192, step=INTERVAL):
+                 gpu_used=8192, step=INTERVAL, power_w=None, power_est_w=None,
+                 gpu_name=None, gpu_scope="job"):
     for i in range(n):
         conn.execute(
-            "INSERT INTO samples (ts,cluster,jid,state,gpu_used,gpu_total,util,gpu_n) "
-            "VALUES (?,?,?,'R',?,?,?,?)",
-            (start_ts + i * step, cluster, jid, gpu_used, 40960, util, gpu_n))
+            "INSERT INTO samples (ts,cluster,jid,state,gpu_used,gpu_total,util,gpu_n,"
+            "power_w,power_est_w,gpu_name,gpu_scope) "
+            "VALUES (?,?,?,'R',?,?,?,?,?,?,?,?)",
+            (start_ts + i * step, cluster, jid, gpu_used, 40960, util, gpu_n,
+             power_w, power_est_w, gpu_name, gpu_scope))
     conn.commit()

@@ -15,6 +15,23 @@ const fmtMin = (m) => m == null ? "—" : m < 60 ? `${Math.round(m)}m`
 const ago = (t) => { const s = Date.now() / 1000 - t;
   return s < 60 ? `${Math.round(s)}s ago` : fmtMin(s / 60) + " ago"; };
 
+/** A 404 body is still valid JSON, so an unchecked fetch paints its fields as
+    "undefined" instead of failing. Throw on the status rather than the parse. */
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} -> ${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+/** "NVIDIA RTX PRO 6000 Blackwell Server Edition" -> "RTX PRO 6000". The full
+    name goes nowhere useful in a table column that narrow. */
+function shortGpu(name) {
+  if (!name) return "";
+  return String(name).replace(/^NVIDIA\s+/, "")
+    .replace(/\s+(Server Edition|Workstation Edition|Blackwell)\b/g, "")
+    .trim();
+}
+
 function utilClass(p) {
   if (p == null) return "faint";
   return p >= 60 ? "good" : p >= 20 ? "warn" : "bad";
@@ -62,7 +79,7 @@ function bar(pct, color) {
 
 const S = { live: null, sel: null, charts: {}, utilDays: 1, tab: "overview",
             filter: "", cmp: new Set(), cmpFilter: "", seriesPending: null,
-            tail: null };
+            tail: null, clDays: 1, cfg: null };
 
 // ----------------------------------------------------------------- charts --
 
@@ -142,12 +159,18 @@ function renderJobs(d) {
     { label: "elapsed", get: r => `<span class="dim">${esc(r.elapsed)}</span>` },
     { label: "left", cls: r => r.minutes_left != null && r.minutes_left < 30 ? "bad" : "dim",
       get: r => esc(r.timeleft) },
+    { label: "gpu", get: r => `<span class="dim trunc" style="display:inline-block">`
+        + `${esc(shortGpu(r.gpu_name))}</span>` },
     { label: "gpu mem", num: true, get: r => r.gpu
         ? `<span class="dim">${r.gpu[0]}/${r.gpu[1]}</span>` : "" },
     { label: "util", num: true, cls: r => r.gpu ? utilClass(r.gpu[2]) : "faint",
       get: r => r.gpu ? r.gpu[2] + "%" : (r.state === "R" ? "n/a" : "") },
     { label: "", get: r => r.gpu ? bar(r.gpu[2], cssVar(r.gpu[2] >= 60 ? "--green"
         : r.gpu[2] >= 20 ? "--yellow" : "--red")) : "" },
+    { label: "watts", num: true, cls: r => r.watts == null ? "faint" : "dim",
+      get: r => r.watts != null ? Math.round(r.watts) + " W"
+              : r.est_watts != null ? `<span title="estimated from TDP x util">~`
+                                      + `${Math.round(r.est_watts)} W</span>` : "" },
     { label: "loss", get: r => spark(r.series, cssVar("--mag")) },
     { label: "log age", num: true, cls: r => r.log_age_min > 20 ? "bad" : "dim",
       get: r => r.log_age_min == null ? "" : fmtMin(r.log_age_min) },
@@ -287,6 +310,8 @@ async function loadUsage() {
         width: 1.5, spanGaps: true })),
     ], 230), [allTs, ...cols]);
   }
+
+  renderMemEff();
 
   const gh = await (await fetch("/api/gpu_hours?days=30")).json();
   const tot = gh.reduce((a, r) => a + r.gpu_h, 0);
@@ -470,9 +495,230 @@ async function loadHistory() {
   ], fin, { onClick: r => { switchTab("overview"); selectJob(r.cluster, r.jid); } }));
 }
 
+/** Asked vs peak used, worst-fitting first. sacct only reports MaxRSS on the
+    batch step, so jobs that finished before that was collected are absent. */
+async function renderMemEff() {
+  const rows = await (await fetch("/api/mem_efficiency?days=30")).json();
+  const node = $("memeff");
+  node.innerHTML = "";
+  if (!rows.length) {
+    node.appendChild(el("div", "empty",
+      "no memory samples yet — this fills in as jobs finish"));
+    return;
+  }
+  const gib = (m) => (m / 1024).toFixed(1) + "G";
+  node.appendChild(table([
+    { label: "host", get: r => `<span class="dim">${esc(r.cluster)}</span>` },
+    { label: "jobid", get: r => esc(r.jid) },
+    { label: "name", get: r => `<span class="trunc" style="display:inline-block">${esc(r.name)}</span>` },
+    { label: "state", cls: r => r.state === "COMPLETED" ? "dim" : "bad",
+      get: r => esc(r.state) },
+    { label: "asked", num: true, get: r => gib(r.req_mib) },
+    { label: "used", num: true, get: r => gib(r.used_mib) },
+    { label: "fit", num: true, cls: r => r.pct >= 60 ? "good" : r.pct >= 25 ? "warn" : "bad",
+      get: r => r.pct.toFixed(0) + "%" },
+    { label: "", get: r => bar(r.pct, cssVar(r.pct >= 60 ? "--green"
+        : r.pct >= 25 ? "--yellow" : "--red")) },
+  ], rows.slice(0, 40)));
+}
+
 async function loadAlertHistory() {
   const a = await (await fetch("/api/alerts?days=14")).json();
   renderAlerts(a, $("alerts-all"), true);
+}
+
+// ----------------------------------------------------------- clusters tab --
+
+const fmtW = (w) => w == null ? "n/a" : w >= 1000 ? (w / 1000).toFixed(2) + " kW"
+                                                 : Math.round(w) + " W";
+
+/** A labelled meter. `used` and `total` are counts, not percentages. */
+function meter(label, used, total, color) {
+  const w = el("div", "meter");
+  const head = el("div", "meter-head");
+  head.appendChild(el("span", null, label));
+  head.appendChild(el("span", "dim", total ? `${used} / ${total}` : "—"));
+  w.appendChild(head);
+  w.appendChild(bar(total ? used / total * 100 : 0, color));
+  return w;
+}
+
+function clusterCapacity(t) {
+  const box = el("div");
+  const pal = PALETTE();
+  box.appendChild(meter("gpus in use", t.gpus_alloc, t.gpus_total, pal[0]));
+  box.appendChild(meter("cpus in use", t.cpus_alloc, t.cpus_total, pal[2]));
+  box.appendChild(meter("nodes busy", t.nodes_alloc + t.nodes_mixed, t.nodes_total, pal[1]));
+
+  const free = el("div", "stats");
+  const stat = (label, value, cls) => {
+    const w = el("div"), st = el("div", "stat");
+    st.appendChild(el("b", cls, String(value)));
+    w.appendChild(st); w.appendChild(el("div", "dim", label));
+    free.appendChild(w);
+  };
+  const idleGpus = Math.max(0, t.gpus_total - t.gpus_alloc);
+  stat("gpus free", idleGpus, idleGpus > 0 ? "good" : "bad");
+  stat("nodes idle", t.nodes_idle, t.nodes_idle > 0 ? "good" : "faint");
+  stat("nodes down", t.nodes_down, t.nodes_down ? "warn" : "faint");
+  box.appendChild(free);
+
+  const models = Object.entries(t.gpu_models || {}).sort((a, b) => b[1] - a[1]);
+  if (models.length) {
+    const m = el("div", "dim", "");
+    m.style.marginTop = "8px";
+    m.innerHTML = models.map(([k, v]) => `${esc(k)}&nbsp;&times;${v}`).join(" &middot; ");
+    box.appendChild(m);
+  }
+  return box;
+}
+
+/** How much of what is running right now is yours. */
+function myShare(name, total) {
+  const mine = (S.live?.jobs || []).filter(j => j.cluster === name && j.state === "R").length;
+  const pct = total ? (mine / total * 100) : 0;
+  const w = el("div", "dim");
+  w.style.marginTop = "8px";
+  w.textContent = total
+    ? `${mine} of ${total} running jobs are yours (${pct.toFixed(0)}%)`
+    : "nothing running";
+  return w;
+}
+
+function naCard(title, why) {
+  const c = el("div", "card");
+  c.appendChild(el("h2", null, title));
+  c.appendChild(el("div", "empty", why));
+  return c;
+}
+
+function powerCard(name, live, kwh) {
+  const c = el("div", "card");
+  c.appendChild(el("h2", null, "power — " + name));
+  const measured = live?.watts, est = live?.est_watts;
+  const stats = el("div", "stats");
+  const stat = (label, value, cls) => {
+    const w = el("div"), st = el("div", "stat");
+    st.appendChild(el("b", cls, value));
+    w.appendChild(st); w.appendChild(el("div", "dim", label));
+    stats.appendChild(w);
+  };
+  const now = measured != null ? measured : est;
+  stat(now == null ? "nothing drawing"
+       : measured != null ? "measured now" : "estimated now",
+       fmtW(now), now == null ? "faint" : measured != null ? "good" : "warn");
+  if (kwh) {
+    stat(`energy (last ${S.clDays}d)`,
+         (kwh.kwh || kwh.est_kwh || 0).toFixed(2) + " kWh");
+    stat("at " + (S.cfg?.price_per_kwh ?? 0.12) + " /kWh", "$" + (kwh.dollars ?? 0).toFixed(2));
+  }
+  c.appendChild(stats);
+  if (measured == null && est != null)
+    c.appendChild(el("div", "dim",
+      "estimated from board TDP x utilization — reads low on an idle card, "
+      + "which still draws 40-60 W"));
+  if (kwh && kwh.node_scoped)
+    c.appendChild(el("div", "warn",
+      `${kwh.node_scoped} job(s) read power off the whole node, not just their `
+      + "own cards — those figures are an upper bound"));
+  return c;
+}
+
+async function loadClusters() {
+  try {
+    await renderClusters();
+  } catch (e) {
+    $("cluster-cards").innerHTML = "";
+    $("cluster-cards").appendChild(naCard("clusters unavailable", String(e.message)));
+    $("cl-note").textContent = "the running service is older than this page — "
+      + "restart jobdash and reload";
+  }
+}
+
+async function renderClusters() {
+  if (!S.cfg) S.cfg = await getJSON("/api/config");
+  const days = S.clDays;
+  const bucket = days <= 1 ? 300 : days <= 7 ? 1800 : 7200;
+  const [stats, en] = await Promise.all([
+    getJSON(`/api/clusters?days=${days}&bucket=${bucket}`),
+    getJSON(`/api/energy?days=${days}`),
+  ]);
+  const byCluster = Object.fromEntries((en.clusters || []).map(c => [c.cluster, c]));
+  const liveBy = Object.fromEntries((S.live?.clusters || []).map(c => [c.name, c]));
+
+  const wrap = $("cluster-cards");
+  wrap.innerHTML = "";
+  const pal = PALETTE();
+
+  const cls = S.cfg.clusters || [];
+  if (cls.length && typeof cls[0] !== "object")
+    throw new Error("/api/config returned cluster names without kind or gpu");
+
+  cls.forEach(cl => {
+    const name = cl.name, st = stats[name], live = liveBy[name];
+
+    if (!st || !st.total) {
+      wrap.appendChild(naCard("queue — " + name, cl.kind === "tmux"
+        ? "no scheduler on this host — there is no queue to report"
+        : "no cluster samples yet — the poller needs a tick"));
+    } else {
+      const t = st.total;
+      const c = el("div", "card");
+      c.appendChild(el("h2", null, "queue — " + name));
+      const s = el("div", "stats");
+      [["running", t.running, "good"], ["pending", t.pending, t.pending ? "warn" : "faint"],
+       ["other", t.other, "faint"]].forEach(([label, v, cls]) => {
+        const w = el("div"), b = el("div", "stat");
+        b.appendChild(el("b", cls, String(v))); w.appendChild(b);
+        w.appendChild(el("div", "dim", label)); s.appendChild(w);
+      });
+      c.appendChild(s);
+      c.appendChild(myShare(name, t.running));
+      const wrapT = el("div", "scroll-x");
+      wrapT.appendChild(table([
+        { label: "partition", get: r => esc(r.partition) },
+        { label: "run", num: true, get: r => r.running },
+        { label: "pend", num: true, get: r => r.pending },
+        { label: "gpus", num: true, get: r => `${r.gpus_alloc}/${r.gpus_total}` },
+        { label: "free", num: true, cls: r => r.gpus_total - r.gpus_alloc > 0 ? "good" : "bad",
+          get: r => r.gpus_total - r.gpus_alloc },
+        { label: "nodes idle", num: true, get: r => `${r.nodes_idle}/${r.nodes_total}` },
+      ], st.partitions));
+      c.appendChild(wrapT);
+      wrap.appendChild(c);
+
+      const cap = el("div", "card");
+      cap.appendChild(el("h2", null, "capacity — " + name));
+      cap.appendChild(clusterCapacity(t));
+      wrap.appendChild(cap);
+    }
+
+    if (!cl.gpu) {
+      wrap.appendChild(naCard("power — " + name, "gpu polling is off for this cluster"));
+    } else {
+      wrap.appendChild(powerCard(name, live, byCluster[name]));
+    }
+
+    if (st && st.series && st.series.ts.length > 1) {
+      const ch = el("div", "card wide");
+      ch.appendChild(el("h2", null, `load — ${name}`));
+      const node = el("div", "chart");
+      node.style.height = "200px";
+      ch.appendChild(node);
+      wrap.appendChild(ch);
+      draw("cl-" + name, node, chartOpts("jobs queued / gpus allocated", [
+        {},
+        { label: "running", stroke: pal[0], width: 1.5, spanGaps: true },
+        { label: "pending", stroke: pal[4], width: 1.5, spanGaps: true },
+        { label: "gpus used", stroke: pal[3], width: 1.5, spanGaps: true },
+        { label: "gpus total", stroke: cssVar("--dim"), width: 1, dash: [4, 4] },
+      ], 200), [st.series.ts, st.series.running, st.series.pending,
+                st.series.gpus_alloc, st.series.gpus_total]);
+    }
+  });
+
+  $("cl-note").textContent = en.clusters?.length
+    ? `energy priced at $${en.price_per_kwh}/kWh` : "";
 }
 
 // ------------------------------------------------------------------- tabs --
@@ -481,10 +727,11 @@ function switchTab(name) {
   S.tab = name;
   document.querySelectorAll("nav button").forEach(b =>
     b.classList.toggle("active", b.dataset.tab === name));
-  ["overview", "usage", "compare", "history", "alerts"].forEach(t =>
+  ["overview", "usage", "clusters", "compare", "history", "alerts"].forEach(t =>
     $("tab-" + t).hidden = t !== name);
   writeHash();
   if (name === "usage") loadUsage();
+  if (name === "clusters") loadClusters();
   if (name === "compare") loadCompare();
   if (name === "history") loadHistory();
   if (name === "alerts") loadAlertHistory();
@@ -584,6 +831,17 @@ $("refresh").onclick = () => fetch("/api/refresh", { method: "POST" });
   $("util-range").appendChild(b);
 });
 
+[[0.25, "6h"], [1, "24h"], [7, "7d"], [30, "30d"]].forEach(([d, label]) => {
+  const b = el("button", d === 1 ? "active" : "", label);
+  b.onclick = () => {
+    S.clDays = d;
+    document.querySelectorAll("#cl-range button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    loadClusters();
+  };
+  $("cl-range").appendChild(b);
+});
+
 // ------------------------------------------------------------------ live ---
 
 function apply(d) {
@@ -593,6 +851,7 @@ function apply(d) {
   renderAlerts(d.alerts, $("alerts-live"), true);
   if (S.sel) selectJob(S.sel.cluster, S.sel.jid);
   if (S.tab === "usage") loadUsage();
+  if (S.tab === "clusters") loadClusters();
 }
 
 function connect() {

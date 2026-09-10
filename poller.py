@@ -18,6 +18,14 @@ from alerts import alerts_for
 from collector import Settings, collect, load_config, minutes_left
 
 
+def watts(snap, idx: int = 4) -> float | None:
+    """Live GPU draw across a cluster's running jobs. None when no card on the
+    cluster reported it, so the UI can say "n/a" instead of showing 0 W."""
+    vals = [j.gpu[idx] for j in snap.jobs
+            if j.gpu and len(j.gpu) > idx and j.gpu[idx] is not None]
+    return round(sum(vals)) if vals else None
+
+
 def job_dict(snap, j) -> dict:
     d = asdict(j)
     d["name"] = j.name.strip()
@@ -25,6 +33,10 @@ def job_dict(snap, j) -> dict:
     d["minutes_left"] = minutes_left(j.timeleft)
     d["log_age_min"] = round((snap.remote_now - j.mtime) / 60, 1) if j.mtime else None
     d["series"] = j.series[-120:]
+    g = j.gpu or ()
+    d["watts"] = g[4] if len(g) > 4 else None
+    d["est_watts"] = g[5] if len(g) > 5 else None
+    d["gpu_name"] = g[6] if len(g) > 6 else ""
     return d
 
 
@@ -74,9 +86,14 @@ class Poller:
             snaps = list(ex.map(
                 lambda c: collect(c, self.st, True, True, self.st.history_days), clusters))
 
+        by_name = {c.name: c for c in clusters}
         active = []
         for s in snaps:
             store.write_snapshot(self.conn, s)
+            # Nothing reports a tmux job's end but its absence, so the store has
+            # to close it out here. Slurm clusters get their ends from sacct.
+            if by_name[s.cluster].kind == "tmux":
+                store.close_vanished(self.conn, s)
             if s.ok:
                 active += alerts_for(s, self.st)
 
@@ -92,7 +109,10 @@ class Poller:
                           "remote_now": s.remote_now,
                           "running": sum(1 for j in s.jobs if j.state == "R"),
                           "pending": sum(1 for j in s.jobs if j.state == "PD"),
-                          "total": len(s.jobs)} for s in snaps],
+                          "total": len(s.jobs),
+                          "watts": watts(s), "est_watts": watts(s, 5),
+                          "cluster_stats": s.cluster_stats.get("ALL")}
+                         for s in snaps],
             "jobs": [job_dict(s, j) for s in snaps if s.ok for j in s.jobs],
             "alerts": self.active_alerts(),
         }

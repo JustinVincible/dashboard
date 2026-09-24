@@ -82,6 +82,7 @@ metrics = { loss = "loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)" }
 # host = "othercluster"
 # user = "myusername"
 # gpu = false
+# node_ssh = false       # skip the ssh-to-compute-node GPU fallback
 
 # A workstation with no scheduler. Every tmux pane running something counts as
 # a job; see tmuxhost.py for how the columns map.
@@ -106,6 +107,7 @@ class Cluster:
     multiplex: bool = False       # ControlMaster reuse; off by default, see ssh_opts_for
     gpu: bool = True              # per-cluster: skip srun --overlap if it is slow/blocked here
     gpu_timeout: int = 12         # hard cap on the GPU probe; it can never hang a refresh
+    node_ssh: bool = True         # fall back to ssh-ing the compute node when srun fails
     ssh_opts: list = field(default_factory=list)   # extra raw ssh flags
 
 
@@ -140,7 +142,7 @@ def load_config() -> Settings:
             metrics=c.get("metrics") or Cluster.metrics.default_factory(),  # type: ignore[attr-defined]
             **{k: v for k, v in c.items()
                if k in ("kind", "connect_timeout", "command_timeout", "batch_mode",
-                        "multiplex", "gpu", "gpu_timeout", "ssh_opts")},
+                        "multiplex", "gpu", "gpu_timeout", "node_ssh", "ssh_opts")},
         ))
     if not s.clusters:
         sys.exit(f"no [[cluster]] blocks in {CONFIG_PATH}")
@@ -234,7 +236,8 @@ SQ_FMT = "%.18i|%.14P|%.34j|%.2t|%.10M|%.10L|%A|%R"
 
 def build_remote_script(user: str, metric_re: str, points: int, history_days: int,
                         want_gpu: bool, want_logs: bool, gpu_timeout: int = 12,
-                        want_cluster: bool = True, want_mem: bool = True) -> str:
+                        want_cluster: bool = True, want_mem: bool = True,
+                        node_ssh: bool = True) -> str:
     """One script, one round-trip: squeue, then per-running-job detail in
     parallel subshells, then sacct history. A serial per-job ssh costs ~1-2s of
     channel setup each; batching keeps a refresh flat regardless of job count.
@@ -263,6 +266,9 @@ def build_remote_script(user: str, metric_re: str, points: int, history_days: in
             # refusal ("Requested nodes are busy", "job step creation temporarily
             # disabled") is reported instead of lost.
             '  gpu=$(TO_ srun --overlap --quiet --jobid=$real ' + q + ' 2>&1 | head -8 | tr "\\n" ";")\n'
+        )
+    if want_gpu and node_ssh:
+        gpu_block += (
             # Attempt 2: many clusters let you ssh a node you hold an allocation
             # on, and it costs nothing when attempt 1 already worked. It runs
             # outside the job step, so it sees every card on the node -- the
@@ -666,7 +672,8 @@ def collect_slurm(cl: Cluster, st: Settings, want_gpu: bool, want_logs: bool,
     want_gpu = want_gpu and cl.gpu
     metric_re = next(iter(cl.metrics.values()))
     script = build_remote_script(cl.user, metric_re, st.metric_points, history_days,
-                                 want_gpu, want_logs, cl.gpu_timeout)
+                                 want_gpu, want_logs, cl.gpu_timeout,
+                                 node_ssh=cl.node_ssh)
     res = ssh(cl.host, script, timeout=cl.command_timeout, opts=ssh_opts_for(cl))
     if not res.ok:
         return Snapshot(cl.name, False, error=res.reason)
@@ -997,7 +1004,8 @@ def check(clusters):
             import tmuxhost
             script = tmuxhost.build_script(metric_re, 20, cl.gpu, True)
         else:
-            script = build_remote_script(cl.user, metric_re, 20, 1, cl.gpu, True)
+            script = build_remote_script(cl.user, metric_re, 20, 1, cl.gpu, True,
+                                         node_ssh=cl.node_ssh)
         t0 = time.time()
         res = ssh(cl.host, script, timeout=cl.command_timeout, opts=opts)
         dt = time.time() - t0

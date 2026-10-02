@@ -33,6 +33,77 @@ def test_cluster_util_reads_the_rollup_behind_raw_retention(conn, now):
 
 # --------------------------------------------------------------- gpu_hours --
 
+# ------------------------------------------------------------ capacity_use --
+
+def test_capacity_counts_jobs_on_a_scheduler_and_gpus_on_a_workstation(conn, now):
+    """A gaivi slot is one job whatever it holds; a wrx80 slot is one card."""
+    bucket = 300
+    base = (now - 600) // bucket * bucket
+    seed_samples(conn, "gaivi", "1", base, bucket // INTERVAL, gpu_n=4)
+    seed_samples(conn, "gaivi", "2", base, bucket // INTERVAL, gpu_n=4)
+    seed_samples(conn, "wrx80", "p1", base, bucket // INTERVAL, gpu_n=2)
+
+    out = queries.capacity_use(conn, {"gaivi": (6, "job"), "wrx80": (2, "gpu")},
+                               days=7, bucket_s=bucket)
+    assert out["series"]["gaivi"]["used"][0] == 2.0   # two jobs, not eight gpus
+    assert out["series"]["wrx80"]["used"][0] == 2.0   # two cards, not one pane
+
+
+def test_capacity_denominator_is_the_whole_window_not_the_observed_span(conn, now):
+    """Idle hosts write no rows, so coverage must not shrink the denominator."""
+    seed_samples(conn, "gaivi", "1", now - 3600, 3600 // INTERVAL, gpu_n=1)
+
+    out = queries.capacity_use(conn, {"gaivi": (6, "job")}, days=7, bucket_s=1800)
+    cl = out["clusters"][0]
+    assert cl["slot_hours_avail"] == 6 * 7 * 24
+    assert abs(cl["slot_hours_used"] - 1.0) < 0.05      # one job for one hour
+    assert abs(cl["pct"] - 100 / 1008) < 0.05
+
+
+def test_capacity_total_is_slot_hour_weighted_not_an_average_of_percentages(conn, now):
+    """gaivi's six slots must outweigh the workstation's two in the headline."""
+    seed_samples(conn, "gaivi", "1", now - 3600, 3600 // INTERVAL, gpu_n=1)
+    seed_samples(conn, "wrx80", "p1", now - 3600, 3600 // INTERVAL, gpu_n=2)
+
+    out = queries.capacity_use(conn, {"gaivi": (6, "job"), "wrx80": (2, "gpu")},
+                               days=7, bucket_s=1800)
+    by = {c["cluster"]: c for c in out["clusters"]}
+    assert out["total"]["slot_hours_avail"] == 8 * 7 * 24
+    mean_of_pcts = (by["gaivi"]["pct"] + by["wrx80"]["pct"]) / 2
+    assert out["total"]["pct"] < mean_of_pcts
+    assert abs(out["total"]["pct"]
+               - 100 * out["total"]["slot_hours_used"] / (8 * 168)) < 0.05
+
+
+def test_capacity_ignores_pending_jobs(conn, now):
+    """util IS NOT NULL is the running-proxy; a queued job holds nothing."""
+    seed_samples(conn, "gaivi", "1", now - 3600, 3600 // INTERVAL, gpu_n=1)
+    conn.execute("INSERT INTO samples (ts,cluster,jid,state,util,gpu_n) "
+                 "VALUES (?,'gaivi','2','PD',NULL,NULL)", (now - 1800,))
+    conn.commit()
+
+    out = queries.capacity_use(conn, {"gaivi": (6, "job")}, days=7, bucket_s=1800)
+    assert max(out["series"]["gaivi"]["used"]) == 1.0
+
+
+def test_capacity_survives_the_rollup(conn, now):
+    """Raw rows folded into hours keep their slot-hours, both units."""
+    slots = {"gaivi": (6, "job"), "wrx80": (2, "gpu")}
+    start = now - 2 * 86400
+    seed_samples(conn, "gaivi", "1", start, 3600 // INTERVAL + 1, gpu_n=4)
+    seed_samples(conn, "wrx80", "p1", start, 3600 // INTERVAL + 1, gpu_n=2)
+
+    before = queries.capacity_use(conn, slots, days=7, bucket_s=1800)
+    assert store.rollup(conn, keep_days=1) > 0
+    after = queries.capacity_use(conn, slots, days=7, bucket_s=1800)
+
+    by_before = {c["cluster"]: c["slot_hours_used"] for c in before["clusters"]}
+    by_after = {c["cluster"]: c["slot_hours_used"] for c in after["clusters"]}
+    assert abs(by_after["gaivi"] - by_before["gaivi"]) < 0.05   # one job, not four gpus
+    assert abs(by_after["wrx80"] - by_before["wrx80"]) < 0.05   # two cards
+    assert abs(by_after["wrx80"] - 2.0) < 0.1
+
+
 def test_gpu_hours_and_waste(conn, now):
     """One hour of wall time on 2 GPUs at 50% util is 2 gpu-h, 1 of them idle."""
     n = 3600 // INTERVAL + 1

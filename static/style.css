@@ -66,7 +66,15 @@ tr.sel td { background:color-mix(in srgb, var(--blue) 14%, transparent); }
 .stat { display:flex; align-items:baseline; gap:8px; }
 .stat b { font-size:19px; font-weight:600; font-variant-numeric:tabular-nums;
          white-space:nowrap; }
+.stat.lead b { font-size:27px; }
 .stats { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+
+.bignum { font-size:58px; font-weight:650; line-height:1; letter-spacing:-1px;
+          font-variant-numeric:tabular-nums; margin-bottom:6px; }
+.cap-row { display:flex; gap:28px; align-items:flex-start; flex-wrap:wrap; }
+.cap-row > div:first-child { flex:none; }
+.cap-meters { flex:1; min-width:240px; }
+.faint-sub { font-size:11px; margin:-6px 0 10px; }
 
 .meter { margin-bottom:10px; }
 .meter-head { display:flex; justify-content:space-between; font-size:11px;

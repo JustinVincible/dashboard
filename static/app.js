@@ -286,10 +286,97 @@ async function selectJob(cluster, jid) {
 
 // -------------------------------------------------------------- usage tab --
 
+/** Stricter than utilClass: the point of this panel is "all of it, all the time". */
+function capClass(pct) {
+  if (pct == null) return "faint";
+  return pct >= 80 ? "good" : pct >= 50 ? "warn" : "bad";
+}
+
+/** Slots you hold right now, counted the way each host rations them. */
+function liveSlots(cluster, unit) {
+  const mine = (S.live?.jobs || []).filter(j => j.cluster === cluster && j.state === "R");
+  if (unit !== "gpu") return mine.length;
+  return mine.reduce((a, j) => a + (j.gpu?.[3] || 0), 0);
+}
+
+/** Big 7-day number plus what is running right now, per host. */
+async function renderCapacity(cap) {
+  const box = $("cap-summary");
+  box.innerHTML = "";
+  if (!cap.clusters.length) {
+    box.appendChild(el("div", "empty",
+      "no host has a `slots` figure in config.toml — set one per [[cluster]]"));
+    return;
+  }
+
+  const row = el("div", "cap-row");
+  const big = el("div");
+  big.appendChild(el("div", "bignum " + capClass(cap.total.pct),
+                     Math.round(cap.total.pct) + "%"));
+  big.appendChild(el("div", "dim", "of your compute used, last 7 days"));
+  big.appendChild(el("div", "faint",
+    `${cap.total.slot_hours_used.toFixed(0)} of `
+    + `${cap.total.slot_hours_avail.toFixed(0)} slot-hours`));
+  row.appendChild(big);
+
+  const meters = el("div", "cap-meters");
+  const pal = PALETTE();
+  cap.clusters.forEach((c, i) => {
+    const used = liveSlots(c.cluster, c.unit);
+    meters.appendChild(meter(`${c.cluster} — ${c.unit}s running now`,
+                             used, c.slots, pal[i % pal.length]));
+    meters.appendChild(el("div", "dim faint-sub",
+      `${Math.round(c.pct)}% over 7d`));
+  });
+  row.appendChild(meters);
+  box.appendChild(row);
+
+  // The denominator is always the full window, so a young database reads as
+  // low usage unless it says how much of the window it actually watched.
+  if (cap.coverage_days < cap.days * 0.9)
+    box.appendChild(el("div", "dim",
+      `history covers ${cap.coverage_days.toFixed(1)} of ${cap.days} days — `
+      + "the percentage counts the unwatched days as idle"));
+}
+
+function drawCapacityChart(cap) {
+  const names = Object.keys(cap.series).filter(n => cap.series[n].ts.length > 1);
+  if (!names.length) {
+    $("chart-cap").innerHTML = '<div class="empty">not enough samples yet</div>';
+    return;
+  }
+  const allTs = [...new Set(names.flatMap(n => cap.series[n].ts))].sort((a, b) => a - b);
+  const idx = new Map(allTs.map((t, i) => [t, i]));
+  const slotOf = Object.fromEntries(cap.clusters.map(c => [c.cluster, c.slots]));
+  const cols = [], series = [{}];
+  const pal = PALETTE();
+  names.forEach((n, i) => {
+    const arr = new Array(allTs.length).fill(null);
+    cap.series[n].ts.forEach((t, k) => { arr[idx.get(t)] = cap.series[n].used[k]; });
+    cols.push(arr);
+    series.push({ label: n, stroke: pal[i % pal.length], width: 1.5, spanGaps: true });
+    cols.push(new Array(allTs.length).fill(slotOf[n] ?? null));
+    series.push({ label: `${n} limit`, stroke: cssVar("--dim"), width: 1, dash: [4, 4] });
+  });
+  // The canvas is shorter than the card so uPlot's legend has somewhere to go.
+  draw("cap", $("chart-cap"), chartOpts("slots held", series, 200), [allTs, ...cols]);
+}
+
 async function loadUsage() {
   const days = S.utilDays;
   const bucket = days <= 1 ? 300 : days <= 7 ? 1800 : 7200;
-  $("util-range-lbl").textContent = `(last ${days < 1 ? days * 24 + "h" : days + "d"})`;
+  const lbl = `(last ${days < 1 ? days * 24 + "h" : days + "d"})`;
+  $("util-range-lbl").textContent = lbl;
+  $("cap-range-lbl").textContent = lbl;
+
+  // The headline percentage is always 7 days; only the chart follows the range
+  // buttons, so a 6h view never rewrites the number the panel exists to show.
+  const [capHead, capSeries] = await Promise.all([
+    getJSON("/api/capacity?days=7&bucket=1800"),
+    days === 7 ? null : getJSON(`/api/capacity?days=${days}&bucket=${bucket}`),
+  ]);
+  await renderCapacity(capHead);
+  drawCapacityChart(capSeries || capHead);
 
   const u = await (await fetch(`/api/cluster_util?days=${days}&bucket=${bucket}`)).json();
   const names = Object.keys(u);
@@ -592,10 +679,11 @@ function naCard(title, why) {
   return c;
 }
 
-function powerCard(name, live, kwh) {
-  const c = el("div", "card");
-  c.appendChild(el("h2", null, "power — " + name));
-  const measured = live?.watts, est = live?.est_watts;
+/** One power block for every gpu-polled host: each one's draw, and the sum. */
+function powerSummaryCard(cls, liveBy, byCluster) {
+  const c = el("div", "card wide");
+  c.appendChild(el("h2", null, "power"));
+
   const stats = el("div", "stats");
   const stat = (label, value, cls) => {
     const w = el("div"), st = el("div", "stat");
@@ -603,24 +691,58 @@ function powerCard(name, live, kwh) {
     w.appendChild(st); w.appendChild(el("div", "dim", label));
     stats.appendChild(w);
   };
-  const now = measured != null ? measured : est;
-  stat(now == null ? "nothing drawing"
-       : measured != null ? "measured now" : "estimated now",
-       fmtW(now), now == null ? "faint" : measured != null ? "good" : "warn");
-  if (kwh) {
-    stat(`energy (last ${S.clDays}d)`,
-         (kwh.kwh || kwh.est_kwh || 0).toFixed(2) + " kWh");
-    stat("at " + (S.cfg?.price_per_kwh ?? 0.12) + " /kWh", "$" + (kwh.dollars ?? 0).toFixed(2));
-  }
+
+  // Measured and estimated are never added together — TDP x util reads low on
+  // an idle card, so a mixed total would quietly understate the draw. The total
+  // sums whatever each host reported and says so when the kinds differ.
+  let total = null, anyEst = false, anyMeasured = false, nodeScoped = 0;
+  let kwh = 0, dollars = 0;
+
+  cls.filter(cl => cl.gpu !== false).forEach(cl => {
+    const live = liveBy[cl.name], en = byCluster[cl.name];
+    const measured = live?.watts, est = live?.est_watts;
+    const cpu = live?.cpu_watts;
+    const gpuNow = measured != null ? measured : est;
+    const now = gpuNow != null || cpu != null ? (gpuNow || 0) + (cpu || 0) : null;
+    if (now != null) {
+      total = (total || 0) + now;
+      if (measured != null || (gpuNow == null && cpu != null)) anyMeasured = true;
+      if (measured == null && gpuNow != null) anyEst = true;
+    }
+    const tag = now == null ? "" : cpu != null ? " (gpu+cpu)" : measured != null ? "" : " (est)";
+    stat(cl.name + tag, fmtW(now),
+         now == null ? "faint" : measured != null || gpuNow == null ? "good" : "warn");
+    if (en) {
+      kwh += en.kwh || en.est_kwh || 0;
+      dollars += en.dollars || 0;
+      nodeScoped += en.node_scoped || 0;
+    }
+  });
+
+  const tot = el("div"), tb = el("div", "stat lead");
+  tb.appendChild(el("b", total == null ? "faint" : anyEst && anyMeasured ? "warn"
+                                                 : anyEst ? "warn" : "good",
+                    fmtW(total)));
+  tot.appendChild(tb);
+  tot.appendChild(el("div", "dim", anyEst && anyMeasured ? "total (partly estimated)"
+                                 : anyEst ? "total (estimated)" : "total now"));
+  stats.appendChild(tot);
   c.appendChild(stats);
-  if (measured == null && est != null)
+
+  const foot = el("div", "dim");
+  foot.style.marginTop = "8px";
+  foot.textContent = `${kwh.toFixed(2)} kWh (GPU only) over the last ${S.clDays}d`
+    + ` — $${dollars.toFixed(2)} at $${S.cfg?.price_per_kwh ?? 0.12}/kWh`;
+  c.appendChild(foot);
+
+  if (anyEst)
     c.appendChild(el("div", "dim",
-      "estimated from board TDP x utilization — reads low on an idle card, "
-      + "which still draws 40-60 W"));
-  if (kwh && kwh.node_scoped)
+      "estimated figures come from board TDP x utilization — they read low on "
+      + "an idle card, which still draws 40-60 W"));
+  if (nodeScoped)
     c.appendChild(el("div", "warn",
-      `${kwh.node_scoped} job(s) read power off the whole node, not just their `
-      + "own cards — those figures are an upper bound"));
+      `${nodeScoped} job(s) read power off the whole node, not just their own `
+      + "cards — those figures are an upper bound"));
   return c;
 }
 
@@ -648,14 +770,15 @@ async function renderClusters() {
 
   const wrap = $("cluster-cards");
   wrap.innerHTML = "";
-  const pal = PALETTE();
 
   const cls = S.cfg.clusters || [];
   if (cls.length && typeof cls[0] !== "object")
     throw new Error("/api/config returned cluster names without kind or gpu");
 
+  wrap.appendChild(powerSummaryCard(cls, liveBy, byCluster));
+
   cls.forEach(cl => {
-    const name = cl.name, st = stats[name], live = liveBy[name];
+    const name = cl.name, st = stats[name];
 
     if (!st || !st.total) {
       wrap.appendChild(naCard("queue — " + name, cl.kind === "tmux"
@@ -692,34 +815,32 @@ async function renderClusters() {
       cap.appendChild(clusterCapacity(t));
       wrap.appendChild(cap);
     }
-
-    if (!cl.gpu) {
-      wrap.appendChild(naCard("power — " + name, "gpu polling is off for this cluster"));
-    } else {
-      wrap.appendChild(powerCard(name, live, byCluster[name]));
-    }
-
-    if (st && st.series && st.series.ts.length > 1) {
-      const ch = el("div", "card wide");
-      ch.appendChild(el("h2", null, `load — ${name}`));
-      const node = el("div", "chart");
-      node.style.height = "200px";
-      ch.appendChild(node);
-      wrap.appendChild(ch);
-      draw("cl-" + name, node, chartOpts("jobs queued / gpus allocated", [
-        {},
-        { label: "running", stroke: pal[0], width: 1.5, spanGaps: true },
-        { label: "pending", stroke: pal[4], width: 1.5, spanGaps: true },
-        { label: "gpus used", stroke: pal[3], width: 1.5, spanGaps: true },
-        { label: "gpus total", stroke: cssVar("--dim"), width: 1, dash: [4, 4] },
-      ], 200), [st.series.ts, st.series.running, st.series.pending,
-                st.series.gpus_alloc, st.series.gpus_total]);
-    }
   });
 
   $("cl-note").textContent = en.clusters?.length
     ? `energy priced at $${en.price_per_kwh}/kWh` : "";
 }
+
+// -------------------------------------------------------------- queue tab --
+
+async function loadSqueue() {
+  $("sq-note").textContent = "fetching squeue…";
+  const res = await fetch("/api/squeue").then(r => r.json());
+  const node = $("squeue");
+  node.innerHTML = "";
+  res.forEach(c => {
+    const card = el("div", "card wide");
+    const h = el("h2"); h.textContent = c.name;
+    const pre = el("pre", "log tall"); pre.textContent = c.text;
+    pre.style.whiteSpace = "pre";
+    pre.style.wordBreak = "normal";
+    card.append(h, pre);
+    node.appendChild(card);
+  });
+  $("sq-note").textContent = `as of ${new Date().toLocaleTimeString()}`;
+}
+
+$("sq-refresh").onclick = loadSqueue;
 
 // ------------------------------------------------------------------- tabs --
 
@@ -727,13 +848,14 @@ function switchTab(name) {
   S.tab = name;
   document.querySelectorAll("nav button").forEach(b =>
     b.classList.toggle("active", b.dataset.tab === name));
-  ["overview", "usage", "clusters", "compare", "history", "alerts"].forEach(t =>
+  ["overview", "usage", "clusters", "compare", "history", "queue", "alerts"].forEach(t =>
     $("tab-" + t).hidden = t !== name);
   writeHash();
   if (name === "usage") loadUsage();
   if (name === "clusters") loadClusters();
   if (name === "compare") loadCompare();
   if (name === "history") loadHistory();
+  if (name === "queue") loadSqueue();
   if (name === "alerts") loadAlertHistory();
 }
 

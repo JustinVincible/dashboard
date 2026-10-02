@@ -72,6 +72,8 @@ price_per_kwh = 0.12     # electricity rate, for the energy panel
 name = "mycluster"
 host = "mycluster"
 user = "myusername"
+# slots = 6              # how many jobs you may run at once here; drives the
+                         # "compute in use" panel. Omit to leave this host out.
 # Regexes with ONE capture group, matched against the whole log.
 # The first key is the one that gets the sparkline.
 metrics = { loss = "loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)" }
@@ -91,6 +93,7 @@ metrics = { loss = "loss[=: ]+([0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?)" }
 # host = "workstation"
 # user = "myusername"
 # kind = "tmux"
+# slots = 2              # on a tmux host a slot is a GPU, not a pane
 """
 
 
@@ -108,7 +111,14 @@ class Cluster:
     gpu: bool = True              # per-cluster: skip srun --overlap if it is slow/blocked here
     gpu_timeout: int = 12         # hard cap on the GPU probe; it can never hang a refresh
     node_ssh: bool = True         # fall back to ssh-ing the compute node when srun fails
+    slots: int = 0                # how much of this host you may occupy at once; 0 = untracked
+    slot_by: str = ""             # what a slot counts: "job" or "gpu". "" => by kind, see slot_unit
     ssh_opts: list = field(default_factory=list)   # extra raw ssh flags
+
+
+def slot_unit(c: Cluster) -> str:
+    """What one slot means on this host. A scheduler rations jobs, a workstation GPUs."""
+    return c.slot_by or ("gpu" if c.kind == "tmux" else "job")
 
 
 @dataclass
@@ -142,7 +152,8 @@ def load_config() -> Settings:
             metrics=c.get("metrics") or Cluster.metrics.default_factory(),  # type: ignore[attr-defined]
             **{k: v for k, v in c.items()
                if k in ("kind", "connect_timeout", "command_timeout", "batch_mode",
-                        "multiplex", "gpu", "gpu_timeout", "node_ssh", "ssh_opts")},
+                        "multiplex", "gpu", "gpu_timeout", "node_ssh", "ssh_opts",
+                        "slots", "slot_by")},
         ))
     if not s.clusters:
         sys.exit(f"no [[cluster]] blocks in {CONFIG_PATH}")
@@ -408,6 +419,16 @@ def log_tail_slurm(cl: Cluster, jid: str, lines: int = 80) -> tuple[str, str]:
     return path, "\n".join(out)
 
 
+SQUEUE_FMT = "%.16i %.14P %.32j %.20u %.2t %.11M %.12b %R"
+
+
+def squeue_all(cl: Cluster) -> str:
+    """The whole cluster's queue, every user, running jobs first."""
+    cmd = f"squeue -S -t,u -o {shlex.quote(SQUEUE_FMT)}"
+    res = ssh(cl.host, cmd, timeout=cl.command_timeout, opts=ssh_opts_for(cl))
+    return res.out if res.ok else f"({res.reason})"
+
+
 # Board TDP in watts, keyed by a substring of the nvidia-smi model name. Used
 # only when the card will not report power.draw; matched longest-first so
 # "A100-SXM4-80GB" does not fall through to a shorter "A100" entry.
@@ -636,6 +657,7 @@ class Snapshot:
     remote_now: int = 0
     error: str = ""
     warn: str = ""
+    cpu_watts: float | None = None                      # host CPU package draw (RAPL)
     cluster_stats: dict = field(default_factory=dict)   # partition -> counts
     mem: dict = field(default_factory=dict)             # jid -> (req_mem, max_rss)
 

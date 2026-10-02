@@ -40,6 +40,17 @@ def _startup():
     poller.start()
 
 
+def q(fn, *args, **kw):
+    """Run a read against the poller's connection, serialized with its writes.
+
+    sqlite3 cannot take concurrent statements on one connection, and the poller
+    writes on this same handle from its own thread. Without this, any endpoint
+    can fail with "bad parameter or other API misuse" mid-refresh.
+    """
+    with store._lock:
+        return fn(poller.conn, *args, **kw)
+
+
 @app.get("/")
 def index():
     return FileResponse(HERE / "static/index.html")
@@ -56,13 +67,14 @@ def config():
     return {"interval": st.interval, "stall_minutes": st.stall_minutes,
             "low_util_pct": st.low_util_pct, "timeleft_warn_min": st.timeleft_warn_min,
             "price_per_kwh": st.price_per_kwh,
-            "clusters": [{"name": c.name, "kind": c.kind, "gpu": c.gpu}
+            "clusters": [{"name": c.name, "kind": c.kind, "gpu": c.gpu,
+                          "slots": c.slots, "slot_unit": collector.slot_unit(c)}
                          for c in st.clusters]}
 
 
 @app.get("/api/series/{cluster}/{jid}")
 def series(cluster: str, jid: str, days: float = 7):
-    return queries.job_series(poller.conn, cluster, jid, days)
+    return q(queries.job_series, cluster, jid, days)
 
 
 @app.get("/api/logtail/{cluster}/{jid}")
@@ -75,61 +87,81 @@ async def logtail(cluster: str, jid: str, lines: int = 80):
     return {"path": path, "text": text}
 
 
+@app.get("/api/squeue")
+async def squeue():
+    """Full squeue per slurm cluster, fetched on demand. Clusters whose last
+    poll failed are skipped rather than left to time out."""
+    up = {c["name"] for c in poller.latest.get("clusters", []) if c["ok"]}
+    slurm = [c for c in poller.st.clusters if c.kind == "slurm"]
+    live = [c for c in slurm if c.name in up]
+    texts = await asyncio.gather(*(asyncio.to_thread(collector.squeue_all, c) for c in live))
+    out = dict(zip((c.name for c in live), texts))
+    return [{"name": c.name, "ok": c.name in out,
+             "text": out.get(c.name, "(not connected)")} for c in slurm]
+
+
 @app.get("/api/cluster_util")
 def cluster_util(days: float = 1, bucket: int = 300):
-    return queries.cluster_util(poller.conn, days, bucket)
+    return q(queries.cluster_util, days, bucket)
+
+
+@app.get("/api/capacity")
+def capacity(days: float = 7, bucket: int = 1800):
+    slots = {c.name: (c.slots, collector.slot_unit(c))
+             for c in poller.st.clusters if c.slots > 0}
+    return q(queries.capacity_use, slots, days, bucket)
 
 
 @app.get("/api/gpu_hours")
 def gpu_hours(days: float = 30):
-    return queries.gpu_hours(poller.conn, days)
+    return q(queries.gpu_hours, days)
 
 
 @app.get("/api/clusters")
 def clusters(days: float = 1, bucket: int = 300):
-    return queries.cluster_stats(poller.conn, days, bucket)
+    return q(queries.cluster_stats, days, bucket)
 
 
 @app.get("/api/energy")
 def energy(days: float = 7):
-    return queries.energy(poller.conn, days, poller.st.price_per_kwh)
+    return q(queries.energy, days, poller.st.price_per_kwh)
 
 
 @app.get("/api/mem_efficiency")
 def mem_efficiency(days: float = 30):
-    return queries.mem_efficiency(poller.conn, days)
+    return q(queries.mem_efficiency, days)
 
 
 @app.get("/api/queue_waits")
 def queue_waits(days: float = 30):
-    return queries.queue_waits(poller.conn, days)
+    return q(queries.queue_waits, days)
 
 
 @app.get("/api/failures")
 def failures(days: float = 30):
-    return queries.failures(poller.conn, days)
+    return q(queries.failures, days)
 
 
 @app.get("/api/finished")
 def finished(days: float = 7):
-    return queries.recent_finished(poller.conn, days)
+    return q(queries.recent_finished, days)
 
 
 @app.get("/api/timeline")
 def timeline(days: float = 7):
-    return queries.timeline(poller.conn, days)
+    return q(queries.timeline, days)
 
 
 @app.get("/api/compare")
 def compare(job: list[str] = Query(default=[]), days: float = 30):
     """?job=cluster/jid repeated. Loss curves for a sweep, on one step axis."""
     pairs = [tuple(j.split("/", 1)) for j in job if "/" in j][:12]
-    return queries.compare_loss(poller.conn, pairs, days)
+    return q(queries.compare_loss, pairs, days)
 
 
 @app.get("/api/alerts")
 def alerts(days: float = 14):
-    return queries.alert_history(poller.conn, days)
+    return q(queries.alert_history, days)
 
 
 @app.post("/api/alerts/{key:path}/ack")

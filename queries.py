@@ -83,6 +83,120 @@ def cluster_util(conn, days: float = 1, bucket_s: int = 300) -> dict:
     return out
 
 
+def capacity_use(conn, slots: dict, days: float = 7, bucket_s: int = 1800) -> dict:
+    """How much of the compute you are allowed to hold you actually held.
+
+    `slots` maps cluster -> (count, unit), where unit is "job" (a scheduler
+    rations parallel jobs) or "gpu" (a workstation rations cards).
+
+    The denominator is fixed at slots x window, never normalized by how long the
+    poller was collecting. An idle host writes no sample rows at all, so scaling
+    by observed coverage would hide exactly the idleness this panel exists to
+    show. `coverage_days` is reported separately so a young database reads as
+    thin history rather than as low usage.
+
+    Slot-hours use the same capped-gap integration as gpu_hours. samples_hourly
+    carries no state column, so both paths gate on util IS NOT NULL as the
+    running-proxy and therefore agree with each other.
+    """
+    since = _since(days)
+    window_h = days * 24
+    out_series: dict = {}
+    per_cluster, tot_used, tot_avail = [], 0.0, 0.0
+
+    def rows(sql, args):
+        # Drain each cursor rather than holding it open across the next
+        # statement; app.py serializes the whole read against the poller.
+        return conn.execute(sql, args).fetchall()
+
+    for cluster, (n_slots, unit) in slots.items():
+        if n_slots <= 0:
+            continue
+        # Mean concurrency in a bucket: the weight summed over the bucket divided
+        # by its distinct timestamps reads as "held at once" rather than scaling
+        # with the poll rate. samples has no primary key and the backfill can
+        # write a job twice at one timestamp, so dedupe before summing.
+        weight = "SUM(gpu_n)" if unit == "gpu" else "COUNT(*)"
+        ts_list, used_list = [], []
+        for r in rows(
+            f"SELECT b, {weight}*1.0/COUNT(DISTINCT ts) AS used FROM ("
+            "  SELECT DISTINCT ts/? AS b, ts, jid, gpu_n FROM samples"
+            "   WHERE cluster=? AND ts>=? AND util IS NOT NULL) "
+            "GROUP BY b ORDER BY b", (bucket_s, cluster, since)):
+            ts_list.append(r["b"] * bucket_s)
+            used_list.append(round(r["used"] or 0, 2))
+
+        # Hourly rows are one per job per hour, so dt_s/3600 is already the
+        # fraction of that hour the job held its slot.
+        hours = max(1, bucket_s // 3600)
+        hweight = "SUM(dt_s * gpu_n)" if unit == "gpu" else "SUM(dt_s)"
+        covered = set(ts_list)
+        for r in rows(
+            f"SELECT hour/? AS b, {hweight}/3600.0 AS used "
+            "FROM samples_hourly WHERE cluster=? AND hour>=? AND util IS NOT NULL "
+            "GROUP BY b ORDER BY b", (bucket_s, cluster, since)):
+            ts = r["b"] * bucket_s
+            if ts in covered:
+                continue
+            ts_list.append(ts)
+            used_list.append(round((r["used"] or 0) / hours, 2))
+
+        order = sorted(range(len(ts_list)), key=lambda i: ts_list[i])
+        out_series[cluster] = {"ts": [ts_list[i] for i in order],
+                               "used": [used_list[i] for i in order]}
+
+        gap_w = "MIN(dt, ?) * gpu_n" if unit == "gpu" else "MIN(dt, ?)"
+        used_h = 0.0
+        for r in rows(
+            f"""
+            WITH s AS (
+              SELECT cluster, jid, ts, gpu_n,
+                     ts - LAG(ts) OVER (PARTITION BY cluster, jid ORDER BY ts) AS dt
+              FROM samples WHERE cluster=? AND ts>=? AND util IS NOT NULL
+            )
+            SELECT SUM({gap_w}) / 3600.0 AS used_h
+            FROM s WHERE dt IS NOT NULL AND dt <= ?
+            """, (cluster, since, CAP_S, CAP_S)):
+            used_h += r["used_h"] or 0.0
+        for r in rows(
+            f"SELECT {hweight}/3600.0 AS used_h FROM samples_hourly "
+            "WHERE cluster=? AND hour>=? AND util IS NOT NULL", (cluster, since)):
+            used_h += r["used_h"] or 0.0
+
+        avail_h = n_slots * window_h
+        per_cluster.append({
+            "cluster": cluster, "slots": n_slots, "unit": unit,
+            "slot_hours_used": round(used_h, 2),
+            "slot_hours_avail": round(avail_h, 2),
+            "pct": round(100 * used_h / avail_h, 1) if avail_h else 0.0,
+        })
+        tot_used += used_h
+        tot_avail += avail_h
+
+    # Coverage leans on the cluster_samples heartbeat, which the poller writes
+    # whether or not anything of yours is running, widened by the span of
+    # samples itself — cluster polling was added later than job polling, so on
+    # this database the heartbeat alone understates how long we have watched.
+    lo, hi = None, None
+    for tbl in ("cluster_samples", "samples"):
+        r = rows(f"SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM {tbl} WHERE ts>=?",
+                 (since,))[0]
+        if r["lo"] is not None:
+            lo = r["lo"] if lo is None else min(lo, r["lo"])
+            hi = r["hi"] if hi is None else max(hi, r["hi"])
+    coverage = (hi - lo) / 86400.0 if lo is not None else 0.0
+
+    return {
+        "days": days,
+        "coverage_days": round(coverage, 2),
+        "clusters": sorted(per_cluster, key=lambda d: -d["slots"]),
+        "total": {"slot_hours_used": round(tot_used, 2),
+                  "slot_hours_avail": round(tot_avail, 2),
+                  "pct": round(100 * tot_used / tot_avail, 1) if tot_avail else 0.0},
+        "series": out_series,
+    }
+
+
 def gpu_hours(conn, days: float = 30) -> list:
     """Per job: GPU-hours held, and how many of them ran below useful load.
 

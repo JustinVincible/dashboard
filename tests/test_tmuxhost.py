@@ -230,3 +230,16 @@ def test_a_real_end_is_never_reopened(conn):
     conn.commit()
     store.close_vanished(conn, Snap("wrx80", True, [Job("1_100")], [], 2000))
     assert conn.execute("SELECT COUNT(*) c FROM finished").fetchone()["c"] == 1
+
+
+def test_cpu_watts_from_rapl_pair():
+    # 50 J over 0.5 s -> 100 W
+    assert tmuxhost.parse_cpu_watts(["1000000 51000000 0 500000000 65532610987"]) == 100.0
+
+
+def test_cpu_watts_counter_wrap():
+    assert tmuxhost.parse_cpu_watts(["99000000 1000000 0 1000000000 100000000"]) == 2.0
+
+
+def test_cpu_watts_unreadable():
+    assert tmuxhost.parse_cpu_watts([]) is None

@@ -25,6 +25,7 @@
   <button data-tab="clusters">clusters</button>
   <button data-tab="compare">compare</button>
   <button data-tab="history">history</button>
+  <button data-tab="queue">queue</button>
   <button data-tab="alerts">alerts</button>
 </nav>
 
@@ -64,6 +65,14 @@
 
 <section id="tab-usage" hidden>
   <div class="grid">
+    <div class="card wide">
+      <h2>compute in use <span class="dim">(your slots, last 7d)</span></h2>
+      <div id="cap-summary"></div>
+    </div>
+    <div class="card wide">
+      <h2>slots in use over time <span class="dim" id="cap-range-lbl"></span></h2>
+      <div class="chart" id="chart-cap" style="height:auto"></div>
+    </div>
     <div class="card wide">
       <h2>gpu utilization <span class="dim" id="util-range-lbl"></span></h2>
       <div style="margin-bottom:8px" id="util-range"></div>
@@ -124,6 +133,15 @@
       <div id="finished"></div>
     </div>
   </div>
+</section>
+
+<section id="tab-queue" hidden>
+  <div class="toolbar">
+    <button id="sq-refresh">refresh</button>
+    <span class="spacer"></span>
+    <span class="dim" id="sq-note"></span>
+  </div>
+  <div class="grid" id="squeue"></div>
 </section>
 
 <section id="tab-alerts" hidden>

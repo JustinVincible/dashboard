@@ -58,6 +58,22 @@ PANE_FMT = PANE_SEP.join([
 ])
 
 
+# CPU package power from the RAPL energy counter (microjoules, wraps at
+# max_energy_range_uj). Two reads half a second apart give a mean draw. The
+# counter is root-only on most kernels, so an unreadable file prints nothing
+# and the dashboard shows no CPU figure.
+CPU_BLOCK = (
+    'echo "@@CPU"\n'
+    'rp=/sys/class/powercap/intel-rapl:0\n'
+    'if [ -r $rp/energy_uj ]; then\n'
+    '  e1=$(cat $rp/energy_uj); t1=$(date +%s%N)\n'
+    '  sleep 0.5\n'
+    '  e2=$(cat $rp/energy_uj); t2=$(date +%s%N)\n'
+    '  echo "$e1 $e2 $t1 $t2 $(cat $rp/max_energy_range_uj)"\n'
+    'fi\n'
+)
+
+
 def build_script(metric_re: str, points: int, want_gpu: bool, want_logs: bool) -> str:
     """One script, one round-trip: GPU inventory, then a record per live pane.
 
@@ -146,7 +162,7 @@ def build_script(metric_re: str, points: int, want_gpu: bool, want_logs: bool) -
         'awk "/^btime/{print \\$2}" /proc/stat\n'
         'echo "@@HZ"\n'
         'getconf CLK_TCK\n'
-        + gpu_block +
+        + CPU_BLOCK + gpu_block +
         'echo "@@JOBS"\n'
         'panes=$(tmux list-panes -a -F ' + shlex.quote(PANE_FMT) + ' 2>/dev/null) || true\n'
         'printf "%s\\n" "$panes" | while IFS="' + PANE_SEP +
@@ -230,6 +246,19 @@ def parse_gpu_inventory(gpu_lines: list, app_lines: list):
     return gpus, apps
 
 
+def parse_cpu_watts(lines: list) -> float | None:
+    """`e1 e2 t1_ns t2_ns max` -> mean package watts, or None when unreadable."""
+    try:
+        e1, e2, t1, t2, wrap = (int(x) for x in lines[0].split())
+    except (IndexError, ValueError):
+        return None
+    dt = (t2 - t1) / 1e9
+    if dt <= 0:
+        return None
+    de = e2 - e1 if e2 >= e1 else e2 + wrap - e1
+    return round(de / 1e6 / dt, 1)
+
+
 def _num(x: str) -> int:
     try:
         return int(float(x))
@@ -295,7 +324,7 @@ def parse(cl: Cluster, st: Settings, out: str, want_gpu: bool = True,
           err: str = "") -> Snapshot:
     """Remote stdout -> Snapshot. Split out from `collect` so the field mapping
     is testable without an ssh."""
-    sections: dict = {"NOW": [], "BOOT": [], "HZ": [], "GPU": [], "APPS": [], "JOBS": []}
+    sections: dict = {"NOW": [], "BOOT": [], "HZ": [], "CPU": [], "GPU": [], "APPS": [], "JOBS": []}
     cur = None
     for line in out.splitlines():
         if line.startswith("@@"):
@@ -353,7 +382,8 @@ def parse(cl: Cluster, st: Settings, out: str, want_gpu: bool = True,
     # Connected fine but the remote script complained — same as the Slurm path,
     # do not render that as "nothing running".
     warn = "" if jobs or not err else err.splitlines()[0][:120]
-    return Snapshot(cl.name, True, jobs, [], now, warn=warn)
+    return Snapshot(cl.name, True, jobs, [], now, warn=warn,
+                    cpu_watts=parse_cpu_watts(sections["CPU"]))
 
 
 # --------------------------------------------------------------- log tail --

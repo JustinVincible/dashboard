@@ -120,8 +120,8 @@ ssh -N -L 8787:localhost:8787 macmini
 | Tab | What it answers |
 |---|---|
 | overview | What is running right now. Filter by name, jobid, partition, or node; the loss column carries a sparkline so trend shows without a click. |
-| usage | Where the GPU-hours went, what fraction ran idle, how long the queue makes you wait, and how much memory each finished job asked for against what it peaked at. |
-| clusters | How busy each machine is for everyone, not just you. Queue depth and free GPUs per partition, node states, the GPU model inventory, live wattage and the energy bill. |
+| usage | Whether you are using the compute you are entitled to, where the GPU-hours went, what fraction ran idle, how long the queue makes you wait, and how much memory each finished job asked for against what it peaked at. |
+| clusters | How busy each machine is for everyone, not just you. Queue depth and free GPUs per partition, node states, and the GPU model inventory. One power block at the top carries every GPU-polled host's live draw and their sum. |
 | compare | Loss curves for several runs on one step axis. Runs of different lengths and start times line up, which is what reading a sweep needs. |
 | history | The Gantt strip and the finished-job table. |
 | alerts | Every alert in the last 14 days, acked or not. |
@@ -191,6 +191,10 @@ Energy integrates watts over the gap between samples with the same `GAP_CAP_S`
 cap `gpu_hours` uses, so an outage is not billed. `price_per_kwh` under
 `[global]` turns kWh into dollars.
 
+Measured and estimated are never added together in the summary. The clusters
+tab sums whatever each host reported and labels the total partly estimated when
+the kinds differ, rather than presenting a mixed figure as measured.
+
 The srun probe is scoped to the job's own cards when the cluster sets
 `ConstrainDevices=yes` — gaivi does. The ssh-to-node fallback runs outside the
 job step and sees the whole box, so those samples are tagged `gpu_scope='node'`
@@ -224,6 +228,27 @@ host = "wrx80"
 user = "justin"
 kind = "tmux"
 ```
+
+### Your own capacity
+
+`slots` says how much of a host you may occupy at once, and it drives the
+"compute in use" panel at the top of the usage tab. A scheduler rations parallel
+jobs, so a slot on gaivi is one job — 6, the QOS limit. A workstation rations
+cards, so a slot on wrx80 is one GPU. `slot_by` overrides that default with
+`"job"` or `"gpu"`; leave it out unless the host is unusual. A cluster without
+`slots` is left out of the panel.
+
+```toml
+[[cluster]]
+name = "gaivi"
+slots = 6
+```
+
+The percentage divides slot-hours held by `slots x window`, always the full
+window. Idle time has to count against you, and an idle host writes no samples
+at all, so scaling the denominator by observed coverage would make idleness
+invisible. The panel reports how much of the window it actually watched instead,
+which is what a young database needs to say.
 
 ## Stopping it
 

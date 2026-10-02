@@ -111,6 +111,7 @@ class Poller:
                           "pending": sum(1 for j in s.jobs if j.state == "PD"),
                           "total": len(s.jobs),
                           "watts": watts(s), "est_watts": watts(s, 5),
+                          "cpu_watts": s.cpu_watts,
                           "cluster_stats": s.cluster_stats.get("ALL")}
                          for s in snaps],
             "jobs": [job_dict(s, j) for s in snaps if s.ok for j in s.jobs],
@@ -137,9 +138,10 @@ class Poller:
             print(self.last_error, flush=True)
 
     def active_alerts(self) -> list:
-        rows = self.conn.execute(
-            "SELECT key,kind,cluster,jid,msg,first_seen,last_seen,acked FROM alerts "
-            "WHERE cleared_at IS NULL ORDER BY first_seen DESC")
+        with store._lock:
+            rows = self.conn.execute(
+                "SELECT key,kind,cluster,jid,msg,first_seen,last_seen,acked FROM alerts "
+                "WHERE cleared_at IS NULL ORDER BY first_seen DESC").fetchall()
         return [dict(r) for r in rows]
 
     def _notify(self, fresh) -> None:

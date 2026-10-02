@@ -21,6 +21,10 @@
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
   </dict>
 
+  <!-- Without a ProcessType, launchd throttles the agent's disk I/O, and the
+       startup rollup over a large database then stalls for minutes. -->
+  <key>ProcessType</key><string>Interactive</string>
+
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>15</integer>

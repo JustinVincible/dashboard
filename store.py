@@ -81,7 +81,9 @@ CREATE INDEX IF NOT EXISTS ix_alerts_last ON alerts(last_seen);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
-_lock = threading.Lock()
+# Reentrant: readers take it at the request boundary, and a writer
+# called from inside one must not deadlock against itself.
+_lock = threading.RLock()
 
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -450,13 +452,16 @@ def _rollup_clusters(conn: sqlite3.Connection, cutoff: int) -> None:
     """
     # *1.0 forces real division; the columns are INTEGER and SQLite would
     # otherwise truncate every hourly mean downward.
+    #
+    # The hour match is a range on bare ts so ix_cluster_samples_ts serves it.
+    # Matching on ts/3600*3600 instead rescans the whole table per group.
     means = ", ".join(f"SUM({c} * n) * 1.0 / SUM(n) AS {c}" for c in CLUSTER_MEANS)
     rows = conn.execute(
         f"""SELECT ts/3600*3600 AS hour, cluster, partition, {means},
                    SUM(n) AS n,
                    (SELECT gpu_models FROM cluster_samples i
                      WHERE i.cluster=o.cluster AND i.partition=o.partition
-                       AND i.ts/3600*3600 = o.ts/3600*3600
+                       AND i.ts >= o.ts/3600*3600 AND i.ts < o.ts/3600*3600 + 3600
                      ORDER BY i.ts DESC LIMIT 1) AS gpu_models
             FROM cluster_samples o WHERE ts < ?
             GROUP BY hour, cluster, partition""", (cutoff,)).fetchall()

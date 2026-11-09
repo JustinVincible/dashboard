@@ -243,3 +243,8 @@ def test_cpu_watts_counter_wrap():
 
 def test_cpu_watts_unreadable():
     assert tmuxhost.parse_cpu_watts([]) is None
+
+
+def test_script_finds_a_per_user_tmux_on_a_bare_ssh_path():
+    script = tmuxhost.build_script("loss", 20, False, False)
+    assert script.splitlines()[0] == 'PATH="$PATH:$HOME/.local/bin"'

@@ -21,6 +21,7 @@
 
 <nav>
   <button data-tab="overview" class="active">overview</button>
+  <button data-tab="town">town</button>
   <button data-tab="usage">usage</button>
   <button data-tab="clusters">clusters</button>
   <button data-tab="compare">compare</button>
@@ -59,6 +60,15 @@
     <div class="card wide">
       <h2>active alerts</h2>
       <div id="alerts-live"></div>
+    </div>
+  </div>
+</section>
+
+<section id="tab-town" hidden>
+  <div class="grid">
+    <div class="card wide">
+      <h2>town <span class="dim">(your machines, live)</span></h2>
+      <div id="town-wrap"><canvas id="town" width="384" height="216"></canvas><div id="town-tip" hidden></div></div>
     </div>
   </div>
 </section>
@@ -157,5 +167,15 @@
 
 <script src="/vendor/uPlot.iife.min.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/town/iso/footprints.js"></script>
+<script src="/static/town/iso/art_base.js"></script>
+<script src="/static/town/iso/art_terrain.js"></script>
+<script src="/static/town/iso/art_ports.js"></script>
+<script src="/static/town/iso/art_machines.js"></script>
+<script src="/static/town/iso/art_decor.js"></script>
+<script src="/static/town/iso/map.js"></script>
+<script src="/static/town/iso/engine.js"></script>
+<script src="/static/town/dock.js"></script>
+<script src="/static/town/iso/town.js"></script>
 </body>
 </html>

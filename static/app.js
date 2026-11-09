@@ -848,8 +848,9 @@ function switchTab(name) {
   S.tab = name;
   document.querySelectorAll("nav button").forEach(b =>
     b.classList.toggle("active", b.dataset.tab === name));
-  ["overview", "usage", "clusters", "compare", "history", "queue", "alerts"].forEach(t =>
+  ["overview", "town", "usage", "clusters", "compare", "history", "queue", "alerts"].forEach(t =>
     $("tab-" + t).hidden = t !== name);
+  try { window.Town?.setActive(name === "town"); } catch (e) { console.error(e); }
   writeHash();
   if (name === "usage") loadUsage();
   if (name === "clusters") loadClusters();
@@ -974,6 +975,7 @@ function apply(d) {
   if (S.sel) selectJob(S.sel.cluster, S.sel.jid);
   if (S.tab === "usage") loadUsage();
   if (S.tab === "clusters") loadClusters();
+  try { window.Town?.update(d); } catch (e) { console.error(e); }
 }
 
 function connect() {

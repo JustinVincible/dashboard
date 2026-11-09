@@ -121,6 +121,9 @@ def build_script(metric_re: str, points: int, want_gpu: bool, want_logs: bool) -
     )
 
     return (
+        # Non-interactive ssh skips the profile, so a per-user tmux install
+        # (~/.local/bin, miniconda) is invisible unless the PATH names it.
+        'PATH="$PATH:$HOME/.local/bin"\n'
         'SH_=" ' + SHELLS + ' "\n'
         'SKIP_=" ' + NOT_JOBS + ' "\n'
         # The job is the shallowest non-shell process at or under the pane.

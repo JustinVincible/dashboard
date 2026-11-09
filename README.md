@@ -1,5 +1,7 @@
 # jobdash — always-on job dashboard
 
+![Example](screenshots/Example.png)
+
 A local web service that watches your Slurm jobs on any cluster you can ssh to,
 plus tmux jobs on a workstation with no scheduler, keeps a real time series in
 SQLite, and serves an interactive dashboard on `http://localhost:8787`.
